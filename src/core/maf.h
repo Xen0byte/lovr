@@ -494,6 +494,42 @@ MAF quat quat_between(quat q, vec3 u, vec3 v) {
   return quat_normalize(q);
 }
 
+MAF void quat_getEuler(quat q, float* x, float* y, float* z) {
+  float unit = (q[0] * q[0]) + (q[1] * q[1]) + (q[2] * q[2]) + (q[3] * q[3]);
+  float test = q[0] * q[3] - q[1] * q[2];
+  const float eps = 1e-7f;
+
+  if (test > (.5f - eps) * unit) {
+    *x = (float) M_PI / 2.f;
+    *y = 2.f * atan2f(q[1], q[0]);
+    *z = 0.f;
+  } else if (test < -(.5f - eps) * unit) {
+    *x = (float) -M_PI / 2.f;
+    *y = -2.f * atan2f(q[1], q[0]);
+    *z = 0.f;
+  } else {
+    *x = asinf(2.f * (q[3] * q[0] - q[1] * q[2]));
+    *y = atan2f(2.f * q[3] * q[1] + 2.f * q[2] * q[0], 1.f - 2.f * (q[0] * q[0] + q[1] * q[1]));
+    *z = atan2f(2.f * q[3] * q[2] + 2.f * q[0] * q[1], 1.f - 2.f * (q[2] * q[2] + q[0] * q[0]));
+  }
+}
+
+MAF quat quat_setEuler(quat q, float x, float y, float z) {
+  float cx = cosf(x * .5f);
+  float sx = sinf(x * .5f);
+  float cy = cosf(y * .5f);
+  float sy = sinf(y * .5f);
+  float cz = cosf(z * .5f);
+  float sz = sinf(z * .5f);
+
+  return quat_set(q,
+    cy * sx * cz + sy * cx * sz,
+    sy * cx * cz - cy * sx * sz,
+    cy * cx * sz - sy * sx * cz,
+    cy * cx * cz + sy * sx * sz
+  );
+}
+
 // mat4
 
 #define MAT4_IDENTITY { 1.f, 0.f, 0.f, 0.f,  0.f, 1.f, 0.f, 0.f,  0.f, 0.f, 1.f, 0.f,  0.f, 0.f, 0.f, 1.f }

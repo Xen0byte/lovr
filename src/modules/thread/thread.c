@@ -1,9 +1,11 @@
 #include "thread/thread.h"
 #include "data/blob.h"
 #include "event/event.h"
+#include "core/job.h"
 #include "core/os.h"
 #include "util.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -32,20 +34,27 @@ struct Channel {
 };
 
 static struct {
-  bool initialized;
+  uint32_t ref;
+  uint32_t workers;
   mtx_t channelLock;
   map_t channels;
 } state;
 
-bool lovrThreadModuleInit(void) {
-  if (state.initialized) return false;
+bool lovrThreadModuleInit(int32_t workers) {
+  if (atomic_fetch_add(&state.ref, 1)) return false;
   mtx_init(&state.channelLock, mtx_plain);
   map_init(&state.channels, 0);
-  return state.initialized = true;
+
+  uint32_t cores = os_get_core_count();
+  if (workers < 0) workers += cores;
+  state.workers = MAX(workers, 0);
+  job_init(state.workers);
+
+  return true;
 }
 
 void lovrThreadModuleDestroy(void) {
-  if (!state.initialized) return;
+  if (atomic_fetch_sub(&state.ref, 1) != 1) return;
   for (size_t i = 0; i < state.channels.size; i++) {
     if (state.channels.values[i] != MAP_NIL) {
       lovrRelease((Channel*) (uintptr_t) state.channels.values[i], lovrChannelDestroy);
@@ -53,7 +62,12 @@ void lovrThreadModuleDestroy(void) {
   }
   mtx_destroy(&state.channelLock);
   map_free(&state.channels);
-  state.initialized = false;
+  job_destroy();
+  memset(&state, 0, sizeof(state));
+}
+
+uint32_t lovrThreadGetWorkerCount(void) {
+  return state.workers;
 }
 
 Channel* lovrThreadGetChannel(const char* name) {
@@ -101,8 +115,7 @@ static int threadFunction(void* data) {
 }
 
 Thread* lovrThreadCreate(ThreadFunction* function, Blob* body) {
-  Thread* thread = calloc(1, sizeof(Thread));
-  lovrAssert(thread, "Out of memory");
+  Thread* thread = lovrCalloc(sizeof(Thread));
   thread->ref = 1;
   thread->body = body;
   thread->function = function;
@@ -115,22 +128,30 @@ void lovrThreadDestroy(void* ref) {
   Thread* thread = ref;
   mtx_destroy(&thread->lock);
   if (thread->handle) thrd_detach(thread->handle);
+  for (uint32_t i = 0; i < thread->argumentCount; i++) {
+    lovrVariantDestroy(&thread->arguments[i]);
+  }
   lovrRelease(thread->body, lovrBlobDestroy);
-  free(thread->error);
-  free(thread);
+  lovrFree(thread->error);
+  lovrFree(thread);
 }
 
-void lovrThreadStart(Thread* thread, Variant* arguments, uint32_t argumentCount) {
+bool lovrThreadStart(Thread* thread, Variant* arguments, uint32_t argumentCount) {
+  lovrCheck(argumentCount <= MAX_THREAD_ARGUMENTS, "Too many Thread arguments (max is %d)", MAX_THREAD_ARGUMENTS);
+
   mtx_lock(&thread->lock);
   if (thread->running) {
     mtx_unlock(&thread->lock);
-    return;
+    return true;
   }
 
-  free(thread->error);
+  lovrFree(thread->error);
   thread->error = NULL;
 
-  lovrAssert(argumentCount <= MAX_THREAD_ARGUMENTS, "Too many Thread arguments (max is %d)", MAX_THREAD_ARGUMENTS);
+  for (uint32_t i = 0; i < thread->argumentCount; i++) {
+    lovrVariantDestroy(&thread->arguments[i]);
+  }
+
   memcpy(thread->arguments, arguments, argumentCount * sizeof(Variant));
   thread->argumentCount = argumentCount;
 
@@ -139,11 +160,12 @@ void lovrThreadStart(Thread* thread, Variant* arguments, uint32_t argumentCount)
   if (thrd_create(&thread->handle, threadFunction, thread) != thrd_success) {
     mtx_unlock(&thread->lock);
     lovrRelease(thread, lovrThreadDestroy);
-    lovrThrow("Could not create thread...sorry");
+    return lovrSetError("Could not create thread...sorry");
   }
 
   thread->running = true;
   mtx_unlock(&thread->lock);
+  return true;
 }
 
 void lovrThreadWait(Thread* thread) {
@@ -161,10 +183,9 @@ const char* lovrThreadGetError(Thread* thread) {
 // Channel
 
 Channel* lovrChannelCreate(uint64_t hash) {
-  Channel* channel = calloc(1, sizeof(Channel));
-  lovrAssert(channel, "Out of memory");
+  Channel* channel = lovrCalloc(sizeof(Channel));
   channel->ref = 1;
-  arr_init(&channel->messages, arr_alloc);
+  arr_init(&channel->messages);
   mtx_init(&channel->lock, mtx_plain);
   cnd_init(&channel->cond);
   channel->hash = hash;
@@ -177,7 +198,7 @@ void lovrChannelDestroy(void* ref) {
   arr_free(&channel->messages);
   mtx_destroy(&channel->lock);
   cnd_destroy(&channel->cond);
-  free(channel);
+  lovrFree(channel);
 }
 
 bool lovrChannelPush(Channel* channel, Variant* variant, double timeout, uint64_t* id) {

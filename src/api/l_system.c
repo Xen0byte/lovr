@@ -126,6 +126,11 @@ static int l_lovrSystemGetCoreCount(lua_State* L) {
   return 1;
 }
 
+static int l_lovrSystemOpenConsole(lua_State* L) {
+  lovrSystemOpenConsole();
+  return 0;
+}
+
 static int l_lovrSystemRequestPermission(lua_State* L) {
   Permission permission = luax_checkenum(L, 1, Permission, NULL);
   lovrSystemRequestPermission(permission);
@@ -168,14 +173,27 @@ static int l_lovrSystemOpenWindow(lua_State* L) {
   }
   lua_pop(L, 1);
 
-  lovrSystemOpenWindow(&window);
+  bool success = lovrSystemOpenWindow(&window);
   lovrRelease(image, lovrImageDestroy);
+  luax_assert(L, success);
   return 0;
 }
 
 static int l_lovrSystemIsWindowOpen(lua_State* L) {
   bool open = lovrSystemIsWindowOpen();
   lua_pushboolean(L, open);
+  return 1;
+}
+
+static int l_lovrSystemIsWindowVisible(lua_State* L) {
+  bool visible = lovrSystemIsWindowVisible();
+  lua_pushboolean(L, visible);
+  return 1;
+}
+
+static int l_lovrSystemIsWindowFocused(lua_State* L) {
+  bool focused = lovrSystemIsWindowFocused();
+  lua_pushboolean(L, focused);
   return 1;
 }
 
@@ -290,12 +308,41 @@ static int l_lovrSystemIsMouseDown(lua_State* L) {
   return 1;
 }
 
+static int l_lovrSystemWasMousePressed(lua_State* L) {
+  int button = luaL_checkint(L, 1) - 1;
+  bool pressed = lovrSystemWasMousePressed(button);
+  lua_pushboolean(L, pressed);
+  return 1;
+}
+
+static int l_lovrSystemWasMouseReleased(lua_State* L) {
+  int button = luaL_checkint(L, 1) - 1;
+  bool released = lovrSystemWasMouseReleased(button);
+  lua_pushboolean(L, released);
+  return 1;
+}
+
+static int l_lovrSystemGetClipboardText(lua_State* L) {
+  const char* text = lovrSystemGetClipboardText();
+  lua_pushstring(L, text);
+  return 1;
+}
+
+static int l_lovrSystemSetClipboardText(lua_State* L) {
+  const char* text = luaL_checkstring(L, 1);
+  lovrSystemSetClipboardText(text);
+  return 0;
+}
+
 static const luaL_Reg lovrSystem[] = {
   { "getOS", l_lovrSystemGetOS },
   { "getCoreCount", l_lovrSystemGetCoreCount },
+  { "openConsole", l_lovrSystemOpenConsole },
   { "requestPermission", l_lovrSystemRequestPermission },
   { "openWindow", l_lovrSystemOpenWindow },
   { "isWindowOpen", l_lovrSystemIsWindowOpen },
+  { "isWindowVisible", l_lovrSystemIsWindowVisible },
+  { "isWindowFocused", l_lovrSystemIsWindowFocused },
   { "getWindowWidth", l_lovrSystemGetWindowWidth },
   { "getWindowHeight", l_lovrSystemGetWindowHeight },
   { "getWindowDimensions", l_lovrSystemGetWindowDimensions },
@@ -310,6 +357,10 @@ static const luaL_Reg lovrSystem[] = {
   { "getMouseY", l_lovrSystemGetMouseY },
   { "getMousePosition", l_lovrSystemGetMousePosition },
   { "isMouseDown", l_lovrSystemIsMouseDown },
+  { "wasMousePressed", l_lovrSystemWasMousePressed },
+  { "wasMouseReleased", l_lovrSystemWasMouseReleased },
+  { "getClipboardText", l_lovrSystemGetClipboardText },
+  { "setClipboardText", l_lovrSystemSetClipboardText },
   { NULL, NULL }
 };
 

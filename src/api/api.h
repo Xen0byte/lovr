@@ -34,17 +34,23 @@ extern StringEntry lovrDefaultShader[];
 extern StringEntry lovrDevice[];
 extern StringEntry lovrDeviceAxis[];
 extern StringEntry lovrDeviceButton[];
+extern StringEntry lovrDisplayType[];
 extern StringEntry lovrDrawMode[];
 extern StringEntry lovrDrawStyle[];
 extern StringEntry lovrEffect[];
 extern StringEntry lovrEventType[];
+extern StringEntry lovrFileAction[];
 extern StringEntry lovrFilterMode[];
+extern StringEntry lovrFoveationLevel[];
 extern StringEntry lovrHeadsetDriver[];
 extern StringEntry lovrHorizontalAlign[];
 extern StringEntry lovrJointType[];
 extern StringEntry lovrKeyboardKey[];
+extern StringEntry lovrLayerType[];
 extern StringEntry lovrMeshStorage[];
 extern StringEntry lovrModelDrawMode[];
+extern StringEntry lovrMotorMode[];
+extern StringEntry lovrOpenMode[];
 extern StringEntry lovrOriginType[];
 extern StringEntry lovrPassType[];
 extern StringEntry lovrPermission[];
@@ -62,7 +68,6 @@ extern StringEntry lovrTextureUsage[];
 extern StringEntry lovrTimeUnit[];
 extern StringEntry lovrUniformAccess[];
 extern StringEntry lovrVerticalAlign[];
-extern StringEntry lovrViewMask[];
 extern StringEntry lovrVolumeUnit[];
 extern StringEntry lovrWinding[];
 extern StringEntry lovrWrapMode[];
@@ -89,9 +94,11 @@ typedef struct {
 #endif
 
 #ifdef LOVR_UNCHECKED
+#define luax_check(L, c, ...) ((void) 0)
 #define luax_checku32(L, i) (uint32_t) lua_tonumber(L, i)
 #define luax_optu32(L, i, x) (uint32_t) luaL_optnumber(L, i, x)
 #else
+#define luax_check(L, c, ...) if (!(c)) { luaL_error(L, __VA_ARGS__); }
 #define luax_checku32(L, i) _luax_checku32(L, i)
 #define luax_optu32(L, i, x) _luax_optu32(L, i, x)
 #endif
@@ -105,6 +112,8 @@ typedef struct {
 #define luax_checkfloat(L, i) (float) luaL_checknumber(L, i)
 #define luax_optfloat(L, i, x) (float) luaL_optnumber(L, i, x)
 #define luax_tofloat(L, i) (float) lua_tonumber(L, i)
+#define luax_assert(L, c) if (!(c)) { luaL_error(L, lovrGetError()); }
+#define luax_pushnilerror(L) lua_pushnil(L), lua_pushstring(L, lovrGetError()), 2
 
 void luax_preload(lua_State* L);
 void _luax_registertype(lua_State* L, const char* name, const luaL_Reg* functions, void (*destructor)(void*));
@@ -120,8 +129,10 @@ void luax_vthrow(void* L, const char* format, va_list args);
 void luax_vlog(void* context, int level, const char* tag, const char* format, va_list args);
 void luax_traceback(lua_State* L, lua_State* T, const char* message, int level);
 int luax_getstack(lua_State* L);
+int luax_pushsuccess(lua_State* L, bool success);
 void luax_pushconf(lua_State* L);
 int luax_setconf(lua_State* L);
+void luax_pushstash(lua_State* L, const char* name);
 void luax_setmainthread(lua_State* L);
 void luax_atexit(lua_State* L, void (*finalizer)(void));
 uint32_t _luax_checku32(lua_State* L, int index);
@@ -159,17 +170,10 @@ bool luax_writefile(const char* filename, const void* data, size_t size);
 struct DataField;
 struct Material;
 struct ColoredString;
-void luax_checkfieldn(lua_State* L, int index, int type, void* data);
-void luax_checkfieldv(lua_State* L, int index, int type, void* data);
-void luax_checkfieldt(lua_State* L, int index, int type, void* data);
-uint32_t luax_checkfieldarray(lua_State* L, int index, const struct DataField* array, char* data);
-void luax_checkdataflat(lua_State* L, int index, int subindex, uint32_t count, const struct DataField* format, char* data);
-void luax_checkdatatuples(lua_State* L, int index, int start, uint32_t count, const struct DataField* format, char* data);
-void luax_checkdatakeys(lua_State* L, int index, int start, uint32_t count, const struct DataField* array, char* data);
-void luax_checkstruct(lua_State* L, int index, const struct DataField* fields, uint32_t count, char* data);
+void luax_checkbufferdata(lua_State* L, int index, const struct DataField* format, char* data);
 int luax_pushbufferdata(lua_State* L, const struct DataField* format, uint32_t count, char* data);
 void luax_pushbufferformat(lua_State* L, const struct DataField* fields, uint32_t count);
-uint32_t luax_gettablestride(lua_State* L, int index, int subindex, struct DataField* fields, uint32_t count);
+int luax_gettablestride(lua_State* L, int type);
 uint32_t luax_checkcomparemode(lua_State* L, int index);
 struct Material* luax_optmaterial(lua_State* L, int index);
 struct ColoredString* luax_checkcoloredstrings(lua_State* L, int index, uint32_t* count, struct ColoredString* stack);
@@ -200,6 +204,7 @@ struct Shape* luax_newsphereshape(lua_State* L, int index);
 struct Shape* luax_newboxshape(lua_State* L, int index);
 struct Shape* luax_newcapsuleshape(lua_State* L, int index);
 struct Shape* luax_newcylindershape(lua_State* L, int index);
+struct Shape* luax_newconvexshape(lua_State* L, int index);
 struct Shape* luax_newmeshshape(lua_State* L, int index);
 struct Shape* luax_newterrainshape(lua_State* L, int index);
 #endif

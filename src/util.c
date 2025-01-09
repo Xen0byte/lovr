@@ -1,42 +1,42 @@
 #include "util.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <stdatomic.h>
+#include <threads.h>
+#include <stdio.h>
 
-// Error handling
-static LOVR_THREAD_LOCAL errorFn* lovrErrorCallback;
-static LOVR_THREAD_LOCAL void* lovrErrorUserdata;
+// Allocation
 
-void lovrSetErrorCallback(errorFn* callback, void* userdata) {
-  lovrErrorCallback = callback;
-  lovrErrorUserdata = userdata;
+void* lovrMalloc(size_t size) {
+  void* data = malloc(size);
+  if (!data) abort();
+  lovrProfileAlloc(data, size);
+  return data;
 }
 
-void lovrThrow(const char* format, ...) {
-  va_list args;
-  va_start(args, format);
-  lovrErrorCallback(lovrErrorUserdata, format, args);
-  va_end(args);
-  exit(EXIT_FAILURE);
+void* lovrCalloc(size_t size) {
+  void* data = calloc(1, size);
+  if (!data) abort();
+  lovrProfileAlloc(data, size);
+  return data;
 }
 
-// Logging
-logFn* lovrLogCallback;
-void* lovrLogUserdata;
-
-void lovrSetLogCallback(logFn* callback, void* userdata) {
-  lovrLogCallback = callback;
-  lovrLogUserdata = userdata;
+void* lovrRealloc(void* old, size_t size) {
+  lovrProfileFree(old);
+  void* data = realloc(old, size);
+  if (!data) abort();
+  lovrProfileAlloc(data, size);
+  return data;
 }
 
-void lovrLog(int level, const char* tag, const char* format, ...) {
-  va_list args;
-  va_start(args, format);
-  lovrLogCallback(lovrLogUserdata, level, tag, format, args);
-  va_end(args);
+void lovrFree(void* data) {
+  lovrProfileFree(data);
+  free(data);
 }
 
 // Refcounting
+
 #if ATOMIC_INT_LOCK_FREE != 2
 #error "Lock-free integer atomics are not supported on this platform, but are required for refcounting"
 #endif
@@ -53,24 +53,47 @@ void lovrRelease(void* object, void (*destructor)(void*)) {
   }
 }
 
-// Dynamic Array
-// Default malloc-based allocator for arr_t (like realloc except well-defined when size is 0)
-void* arr_alloc(void* data, size_t size) {
-  if (size > 0) {
-    return realloc(data, size);
-  } else {
-    free(data);
-    return NULL;
-  }
+// Errors
+
+static thread_local char error[1024];
+
+const char* lovrGetError(void) {
+  return error;
+}
+
+int lovrSetError(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  vsnprintf(error, sizeof(error), format, args);
+  va_end(args);
+  return false;
+}
+
+// Logging
+
+static fn_log* lovrLogCallback;
+static void* lovrLogUserdata;
+
+void lovrSetLogCallback(fn_log* callback, void* userdata) {
+  lovrLogCallback = callback;
+  lovrLogUserdata = userdata;
+}
+
+void lovrLog(int level, const char* tag, const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  lovrLogCallback(lovrLogUserdata, level, tag, format, args);
+  va_end(args);
 }
 
 // Hashmap
+
 static void map_rehash(map_t* map) {
   map_t old = *map;
   map->size <<= 1;
-  map->hashes = malloc(2 * map->size * sizeof(uint64_t));
+  if (map->size == 0) abort();
+  map->hashes = lovrMalloc(2 * map->size * sizeof(uint64_t));
   map->values = map->hashes + map->size;
-  lovrAssert(map->size && map->hashes, "Out of memory");
   memset(map->hashes, 0xff, 2 * map->size * sizeof(uint64_t));
 
   if (old.hashes) {
@@ -85,7 +108,7 @@ static void map_rehash(map_t* map) {
         map->values[index] = old.values[i];
       }
     }
-    free(old.hashes);
+    lovrFree(old.hashes);
   }
 }
 
@@ -111,7 +134,10 @@ void map_init(map_t* map, uint32_t n) {
 }
 
 void map_free(map_t* map) {
-  free(map->hashes);
+  if (map) {
+    lovrFree(map->hashes);
+    map->hashes = NULL;
+  }
 }
 
 uint64_t map_get(map_t* map, uint64_t hash) {
@@ -129,34 +155,9 @@ void map_set(map_t* map, uint64_t hash, uint64_t value) {
   map->values[h] = value;
 }
 
-void map_remove(map_t* map, uint64_t hash) {
-  uint64_t h = map_find(map, hash);
-
-  if (map->hashes[h] == MAP_NIL) {
-    return;
-  }
-
-  uint64_t mask = map->size - 1;
-  uint64_t i = h;
-
-  do {
-    i = (i + 1) & mask;
-    uint64_t x = map->hashes[i] & mask;
-    // Removing a key from an open-addressed hash table is complicated
-    if ((i > h && (x <= h || x > i)) || (i < h && (x <= h && x > i))) {
-      map->hashes[h] = map->hashes[i];
-      map->values[h] = map->values[i];
-      h = i;
-    }
-  } while (map->hashes[i] != MAP_NIL);
-
-  map->hashes[i] = MAP_NIL;
-  map->values[i] = MAP_NIL;
-  map->used--;
-}
-
 // UTF-8
 // https://github.com/starwing/luautf8
+
 size_t utf8_decode(const char *s, const char *e, unsigned *pch) {
   unsigned ch;
 
@@ -226,6 +227,8 @@ void utf8_encode(uint32_t c, char s[4]) {
 // f16
 // http://fox-toolkit.org/ftp/fasthalffloatconversion.pdf
 
+static bool float16Initialized = false;
+
 // f32 to f16 tables
 static uint16_t base[512];
 static uint8_t shift[512];
@@ -236,6 +239,9 @@ static uint32_t exponent[64];
 static uint16_t offset[64];
 
 void float16Init(void) {
+  if (float16Initialized) return;
+  float16Initialized = true;
+
   for (uint32_t i = 0; i < 256; i++) {
     int e = i - 127;
     if (e < -24) {

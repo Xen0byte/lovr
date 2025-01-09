@@ -2,6 +2,7 @@
 #include "data/blob.h"
 #include "event/event.h"
 #include "thread/thread.h"
+#include "core/os.h"
 #include "util.h"
 #include <lualib.h>
 #include <stdlib.h>
@@ -11,7 +12,6 @@ static char* threadRunner(Thread* thread, Blob* body, Variant* arguments, uint32
   lua_State* L = luaL_newstate();
   luaL_openlibs(L);
   luax_preload(L);
-  lovrSetErrorCallback((errorFn*) luax_vthrow, L);
 
   lua_pushcfunction(L, luax_getstack);
   int errhandler = lua_gettop(L);
@@ -22,6 +22,7 @@ static char* threadRunner(Thread* thread, Blob* body, Variant* arguments, uint32
     }
 
     if (!lua_pcall(L, argumentCount, 0, errhandler)) {
+      lua_close(L);
       return NULL;
     }
   }
@@ -29,9 +30,9 @@ static char* threadRunner(Thread* thread, Blob* body, Variant* arguments, uint32
   // Error handling
   size_t length;
   const char* message = lua_tolstring(L, -1, &length);
-  char* error = message ? malloc(length + 1) : NULL;
 
-  if (error) {
+  if (message) {
+    char* error = lovrMalloc(length + 1);
     memcpy(error, message, length + 1);
     lua_close(L);
     return error;
@@ -47,13 +48,12 @@ static int l_lovrThreadNewThread(lua_State* L) {
     size_t length;
     const char* str = luaL_checklstring(L, 1, &length);
     if (memchr(str, '\n', MIN(1024, length))) {
-      void* data = malloc(length + 1);
-      lovrAssert(data, "Out of memory");
+      void* data = lovrMalloc(length + 1);
       memcpy(data, str, length + 1);
       blob = lovrBlobCreate(data, length, "thread code");
     } else {
       void* code = luax_readfile(str, &length);
-      lovrAssert(code, "Could not read thread code from file '%s'", str);
+      if (!code) luaL_error(L, "Could not read thread code from file '%s'", str);
       blob = lovrBlobCreate(code, length, str);
     }
   } else {
@@ -63,6 +63,13 @@ static int l_lovrThreadNewThread(lua_State* L) {
   luax_pushtype(L, Thread, thread);
   lovrRelease(thread, lovrThreadDestroy);
   lovrRelease(blob, lovrBlobDestroy);
+  return 1;
+}
+
+static int l_lovrThreadNewChannel(lua_State* L) {
+  Channel* channel = lovrChannelCreate(0);
+  luax_pushtype(L, Channel, channel);
+  lovrRelease(channel, lovrChannelDestroy);
   return 1;
 }
 
@@ -76,6 +83,7 @@ static int l_lovrThreadGetChannel(lua_State* L) {
 
 static const luaL_Reg lovrThreadModule[] = {
   { "newThread", l_lovrThreadNewThread },
+  { "newChannel", l_lovrThreadNewChannel },
   { "getChannel", l_lovrThreadGetChannel },
   { NULL, NULL }
 };
@@ -88,8 +96,24 @@ int luaopen_lovr_thread(lua_State* L) {
   luax_register(L, lovrThreadModule);
   luax_registertype(L, Thread);
   luax_registertype(L, Channel);
-  if (lovrThreadModuleInit()) {
-    luax_atexit(L, lovrThreadModuleDestroy);
+
+  int32_t workers = -1;
+
+  luax_pushconf(L);
+  if (lua_istable(L, -1)) {
+    lua_getfield(L, -1, "thread");
+    if (lua_istable(L, -1)) {
+      lua_getfield(L, -1, "workers");
+      if (lua_type(L, -1) == LUA_TNUMBER) {
+        workers = lua_tointeger(L, -1);
+      }
+      lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
   }
+  lua_pop(L, 1);
+
+  lovrThreadModuleInit(workers);
+  luax_atexit(L, lovrThreadModuleDestroy);
   return 1;
 }

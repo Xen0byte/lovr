@@ -13,6 +13,7 @@
 
 #define MOVESPEED 3.f
 #define SPRINTSPEED 15.f
+#define SLOWSPEED .5f
 #define MOVESMOOTH 30.f
 #define TURNSPEED .005f
 #define TURNSMOOTH 30.f
@@ -26,18 +27,22 @@ struct Layer {
   float orientation[4];
   float width;
   float height;
-  ViewMask mask;
+  float curve;
   int32_t viewport[4];
+  Texture* texture;
+  Pass* pass;
 };
 
 static struct {
   bool initialized;
+  bool active;
   HeadsetConfig config;
   TextureFormat depthFormat;
   Texture* texture;
   Pass* pass;
   Layer* layers[MAX_LAYERS];
   uint32_t layerCount;
+  bool showMainLayer;
   float pitch;
   float yaw;
   float distance;
@@ -60,14 +65,8 @@ static struct {
   float clipFar;
 } state;
 
-static void onFocus(bool focused) {
-  state.focused = focused;
-  lovrEventPush((Event) { .type = EVENT_FOCUS, .data.boolean = { focused } });
-}
-
 static bool simulator_init(HeadsetConfig* config) {
   state.config = *config;
-  state.epoch = os_get_time();
   state.clipNear = .01f;
   state.clipFar = 0.f;
   state.distance = .5f;
@@ -80,13 +79,16 @@ static bool simulator_init(HeadsetConfig* config) {
     state.initialized = true;
   }
 
-  state.focused = true;
-  os_on_focus(onFocus);
+  state.focused = os_window_is_focused();
 
   return true;
 }
 
-static void simulator_start(void) {
+static bool simulator_start(void) {
+  if (state.active) {
+    return true;
+  }
+
 #ifdef LOVR_DISABLE_GRAPHICS
   bool hasGraphics = false;
 #else
@@ -94,15 +96,23 @@ static void simulator_start(void) {
 #endif
 
   if (hasGraphics) {
-    state.pass = lovrPassCreate();
+    state.pass = lovrPassCreate("Headset");
+    if (!state.pass) return false;
     state.depthFormat = state.config.stencil ? FORMAT_D32FS8 : FORMAT_D32F;
-    if (state.config.stencil && !lovrGraphicsGetFormatSupport(state.depthFormat, TEXTURE_FEATURE_RENDER)) {
-      state.depthFormat = FORMAT_D24S8; // Guaranteed to be supported if the other one isn't
+    if (!lovrGraphicsGetFormatSupport(state.depthFormat, TEXTURE_FEATURE_RENDER)) {
+      state.depthFormat = state.config.stencil ? FORMAT_D24S8 : FORMAT_D24;
     }
   }
+
+  state.epoch = os_get_time();
+  state.time = 0.;
+  state.active = true;
+  state.showMainLayer = true;
+  return true;
 }
 
 static void simulator_stop(void) {
+  if (!state.active) return;
   for (uint32_t i = 0; i < state.layerCount; i++) {
     lovrRelease(state.layers[i], lovrLayerDestroy);
   }
@@ -110,6 +120,7 @@ static void simulator_stop(void) {
   lovrRelease(state.pass, lovrPassDestroy);
   state.texture = NULL;
   state.pass = NULL;
+  state.active = false;
 }
 
 static void simulator_destroy(void) {
@@ -120,6 +131,27 @@ static bool simulator_getDriverName(char* name, size_t length) {
   strncpy(name, "LÖVR", length - 1);
   name[length - 1] = '\0';
   return true;
+}
+
+static void simulator_getFeatures(HeadsetFeatures* features) {
+  features->overlay = false;
+  features->proximity = false;
+  features->passthrough = false;
+  features->refreshRate = false;
+  features->depthSubmission = false;
+  features->eyeTracking = false;
+  features->handTracking = false;
+  features->handTrackingElbow = false;
+  features->keyboardTracking = false;
+  features->viveTrackers = false;
+  features->handModel = false;
+  features->controllerModel = false;
+  features->controllerSkeleton = false;
+  features->layerCube = false;
+  features->layerSphere = false;
+  features->layerCurve = false;
+  features->layerDepthTest = false;
+  features->layerFilter = false;
 }
 
 static bool simulator_getName(char* name, size_t length) {
@@ -135,6 +167,8 @@ static bool simulator_isSeated(void) {
 static void simulator_getDisplayDimensions(uint32_t* width, uint32_t* height) {
   float density = os_window_get_pixel_density();
   os_window_get_size(width, height);
+  *width *= state.config.supersample;
+  *height *= state.config.supersample;
   *width *= density;
   *height *= density;
 }
@@ -144,11 +178,20 @@ static float simulator_getRefreshRate(void) {
 }
 
 static bool simulator_setRefreshRate(float refreshRate) {
-  return false;
+  return lovrSetError("Device does not support setting refresh rate");
 }
 
 static const float* simulator_getRefreshRates(uint32_t* count) {
   return *count = 0, NULL;
+}
+
+static void simulator_getFoveation(FoveationLevel* level, bool* dynamic) {
+  *level = FOVEATION_NONE;
+  *dynamic = false;
+}
+
+static bool simulator_setFoveation(FoveationLevel level, bool dynamic) {
+  return level == FOVEATION_NONE;
 }
 
 static PassthroughMode simulator_getPassthrough(void) {
@@ -248,7 +291,7 @@ static bool simulator_getAxis(Device device, DeviceAxis axis, vec3 value) {
   return false;
 }
 
-static bool simulator_getSkeleton(Device device, float* poses) {
+static bool simulator_getSkeleton(Device device, float* poses, SkeletonSource* source) {
   return false;
 }
 
@@ -268,25 +311,43 @@ static bool simulator_animate(struct Model* model) {
   return false;
 }
 
-static Layer* simulator_newLayer(uint32_t width, uint32_t height) {
-  Layer* layer = calloc(1, sizeof(Layer));
+static Texture* simulator_setBackground(uint32_t width, uint32_t height, uint32_t layers) {
+  lovrSetError("NYI");
+  return NULL;
+}
+
+static Layer* simulator_newLayer(const LayerInfo* info) {
+  Layer* layer = lovrCalloc(sizeof(Layer));
   layer->ref = 1;
-  layer->textureWidth = width;
-  layer->textureWeight = height;
+  layer->textureWidth = info->width;
+  layer->textureWeight = info->height;
+  layer->texture = lovrTextureCreate(&(TextureInfo) {
+    .format = FORMAT_RGBA8,
+    .type = info->stereo ? TEXTURE_ARRAY : TEXTURE_2D,
+    .width = info->width,
+    .height = info->height,
+    .layers = 1 << info->stereo,
+    .usage = TEXTURE_RENDER | TEXTURE_TRANSFER,
+    .srgb = true
+  });
+  layer->pass = lovrPassCreate("Layer");
   return layer;
 }
 
 static void simulator_destroyLayer(void* ref) {
   Layer* layer = ref;
-  free(layer);
+  lovrRelease(layer->texture, lovrTextureDestroy);
+  lovrRelease(layer->pass, lovrPassDestroy);
+  lovrFree(layer);
 }
 
-static Layer** simulator_getLayers(uint32_t* count) {
+static Layer** simulator_getLayers(uint32_t* count, bool* main) {
   *count = state.layerCount;
+  *main = state.showMainLayer;
   return state.layers;
 }
 
-static void simulator_setLayers(Layer** layers, uint32_t count) {
+static bool simulator_setLayers(Layer** layers, uint32_t count, bool main) {
   lovrCheck(count <= MAX_LAYERS, "Too many layers");
 
   for (uint32_t i = 0; i < state.layerCount; i++) {
@@ -298,6 +359,10 @@ static void simulator_setLayers(Layer** layers, uint32_t count) {
     lovrRetain(layers[i]);
     state.layers[i] = layers[i];
   }
+
+  state.showMainLayer = main;
+
+  return true;
 }
 
 static void simulator_getLayerPose(Layer* layer, float* position, float* orientation) {
@@ -310,22 +375,34 @@ static void simulator_setLayerPose(Layer* layer, float* position, float* orienta
   memcpy(layer->orientation, orientation, 4 * sizeof(float));
 }
 
-static void simulator_getLayerSize(Layer* layer, float* width, float* height) {
+static void simulator_getLayerDimensions(Layer* layer, float* width, float* height) {
   *width = layer->width;
   *height = layer->height;
 }
 
-static void simulator_setLayerSize(Layer* layer, float width, float height) {
+static void simulator_setLayerDimensions(Layer* layer, float width, float height) {
   layer->width = width;
   layer->height = height;
 }
 
-static ViewMask simulator_getLayerViewMask(Layer* layer) {
-  return layer->mask;
+static void simulator_getLayerColor(Layer* layer, float color[4]) {
+  color[0] = 1.f;
+  color[1] = 1.f;
+  color[2] = 1.f;
+  color[3] = 1.f;
 }
 
-static void simulator_setLayerViewMask(Layer* layer, ViewMask mask) {
-  layer->mask = mask;
+static void simulator_setLayerColor(Layer* layer, float color[4]) {
+  //
+}
+
+static float simulator_getLayerCurve(Layer* layer) {
+  return layer->curve;
+}
+
+static bool simulator_setLayerCurve(Layer* layer, float curve) {
+  layer->curve = curve;
+  return true;
 }
 
 static void simulator_getLayerViewport(Layer* layer, int32_t viewport[4]) {
@@ -338,29 +415,23 @@ static void simulator_setLayerViewport(Layer* layer, int32_t viewport[4]) {
   if (layer->viewport[3] == 0) layer->viewport[3] = layer->height - layer->viewport[1];
 }
 
-static bool simulator_getLayerFlag(Layer* layer, LayerFlag flag) {
-  return false;
-}
-
-static void simulator_setLayerFlag(Layer* layer, LayerFlag flag, bool enable) {
-  //
-}
-
 static struct Texture* simulator_getLayerTexture(Layer* layer) {
-  return NULL; // TODO
+  return layer->texture;
 }
 
 static struct Pass* simulator_getLayerPass(Layer* layer) {
-  return NULL; // TODO
+  return layer->pass;
 }
 
-static Texture* simulator_getTexture(void) {
-  return state.texture;
+static bool simulator_getTexture(Texture** texture) {
+  *texture = state.texture;
+  return true;
 }
 
-static Pass* simulator_getPass(void) {
+static bool simulator_getPass(Pass** pass) {
   if (!state.pass || !os_window_is_open()) {
-    return NULL;
+    *pass = NULL;
+    return true;
   }
 
   lovrPassReset(state.pass);
@@ -380,11 +451,17 @@ static Pass* simulator_getPass(void) {
       .layers = 1,
       .mipmaps = 1,
       .samples = 1,
-      .usage = TEXTURE_RENDER | TEXTURE_SAMPLE,
+      .usage = TEXTURE_RENDER | TEXTURE_SAMPLE
     });
 
-    Texture* textures[4] = { state.texture };
-    lovrPassSetCanvas(state.pass, textures, NULL, state.depthFormat, state.config.antialias ? 4 : 1);
+    if (!state.texture) {
+      return false;
+    }
+
+    CanvasTexture color[4] = { [0].texture = state.texture };
+    if (!lovrPassSetCanvas(state.pass, color, NULL, state.depthFormat, NULL, state.config.antialias ? 4 : 1)) {
+      return false;
+    }
   }
 
   float background[4][4];
@@ -405,18 +482,45 @@ static Pass* simulator_getPass(void) {
   lovrPassSetViewMatrix(state.pass, 0, viewMatrix);
   lovrPassSetProjection(state.pass, 0, projection);
 
-  return state.pass;
+  *pass = state.pass;
+  return true;
 }
 
-static void simulator_submit(void) {
-  //
+static bool simulator_submit(void) {
+  return true;
+}
+
+static bool simulator_isActive(void) {
+  return state.active;
+}
+
+static bool simulator_isVisible(void) {
+  return true;
 }
 
 static bool simulator_isFocused(void) {
-  return state.focused;
+  return os_window_is_focused();
 }
 
-static double simulator_update(void) {
+static bool simulator_isMounted(void) {
+  return true;
+}
+
+static bool simulator_update(double* dt) {
+  if (!state.active) {
+    *dt = 0.;
+    return true;
+  }
+
+  if (os_window_is_focused() != state.focused) {
+    state.focused = !state.focused;
+    lovrEventPush((Event) {
+      .type = EVENT_FOCUS,
+      .data.focus.focused = state.focused,
+      .data.focus.display = DISPLAY_HEADSET
+    });
+  }
+
   double t = os_get_time() - state.epoch;
   state.dt = t - state.time;
   state.time = t;
@@ -437,8 +541,8 @@ static double simulator_update(void) {
     state.pitch = CLAMP(state.pitch - (state.my - myprev) * TURNSPEED, -(float) M_PI / 2.f, (float) M_PI / 2.f);
     state.yaw -= (state.mx - mxprev) * TURNSPEED;
   } else {
-    state.mxHand = state.mx;
-    state.myHand = state.my;
+    state.mxHand = state.mx * state.config.supersample;
+    state.myHand = state.my * state.config.supersample;
   }
 
   // Head
@@ -450,6 +554,7 @@ static double simulator_update(void) {
   quat_slerp(state.headOrientation, target, 1.f - expf(-TURNSMOOTH * state.dt));
 
   bool sprint = os_is_key_down(OS_KEY_LEFT_SHIFT) || os_is_key_down(OS_KEY_RIGHT_SHIFT);
+  bool slow = os_is_key_down(OS_KEY_LEFT_CONTROL) || os_is_key_down(OS_KEY_RIGHT_CONTROL);
   bool front = os_is_key_down(OS_KEY_W) || os_is_key_down(OS_KEY_UP);
   bool back = os_is_key_down(OS_KEY_S) || os_is_key_down(OS_KEY_DOWN);
   bool left = os_is_key_down(OS_KEY_A) || os_is_key_down(OS_KEY_LEFT);
@@ -461,7 +566,7 @@ static double simulator_update(void) {
   velocity[0] = (left ? -1.f : right ? 1.f : 0.f);
   velocity[1] = (down ? -1.f : up ? 1.f : 0.f);
   velocity[2] = (front ? -1.f : back ? 1.f : 0.f);
-  vec3_scale(velocity, sprint ? SPRINTSPEED : MOVESPEED);
+  vec3_scale(velocity, sprint ? SPRINTSPEED : (slow ? SLOWSPEED : MOVESPEED));
   vec3_lerp(state.velocity, velocity, 1.f - expf(-MOVESMOOTH * state.dt));
 
   vec3_scale(vec3_init(velocity, state.velocity), state.dt);
@@ -478,6 +583,8 @@ static double simulator_update(void) {
   float ray[3];
   uint32_t width, height;
   os_window_get_size(&width, &height);
+  width *= state.config.supersample;
+  height *= state.config.supersample;
   vec3_set(ray, state.mxHand / width * 2.f - 1.f, state.myHand / height * 2.f - 1.f, 1.f);
 
   mat4_mulPoint(inverseProjection, ray);
@@ -498,7 +605,8 @@ static double simulator_update(void) {
   mat4_target(basis, zero, ray, y);
   quat_fromMat4(state.handOrientation, basis);
 
-  return state.dt;
+  *dt = state.dt;
+  return true;
 }
 
 HeadsetInterface lovrHeadsetSimulatorDriver = {
@@ -508,12 +616,15 @@ HeadsetInterface lovrHeadsetSimulatorDriver = {
   .stop = simulator_stop,
   .destroy = simulator_destroy,
   .getDriverName = simulator_getDriverName,
+  .getFeatures = simulator_getFeatures,
   .getName = simulator_getName,
   .isSeated = simulator_isSeated,
   .getDisplayDimensions = simulator_getDisplayDimensions,
   .getRefreshRate = simulator_getRefreshRate,
   .setRefreshRate = simulator_setRefreshRate,
   .getRefreshRates = simulator_getRefreshRates,
+  .getFoveation = simulator_getFoveation,
+  .setFoveation = simulator_setFoveation,
   .getPassthrough = simulator_getPassthrough,
   .setPassthrough = simulator_setPassthrough,
   .isPassthroughSupported = simulator_isPassthroughSupported,
@@ -536,25 +647,29 @@ HeadsetInterface lovrHeadsetSimulatorDriver = {
   .stopVibration = simulator_stopVibration,
   .newModelData = simulator_newModelData,
   .animate = simulator_animate,
+  .setBackground = simulator_setBackground,
   .newLayer = simulator_newLayer,
   .destroyLayer = simulator_destroyLayer,
   .getLayers = simulator_getLayers,
   .setLayers = simulator_setLayers,
   .getLayerPose = simulator_getLayerPose,
   .setLayerPose = simulator_setLayerPose,
-  .getLayerSize = simulator_getLayerSize,
-  .setLayerSize = simulator_setLayerSize,
-  .getLayerViewMask = simulator_getLayerViewMask,
-  .setLayerViewMask = simulator_setLayerViewMask,
+  .getLayerDimensions = simulator_getLayerDimensions,
+  .setLayerDimensions = simulator_setLayerDimensions,
+  .getLayerCurve = simulator_getLayerCurve,
+  .setLayerCurve = simulator_setLayerCurve,
+  .getLayerColor = simulator_getLayerColor,
+  .setLayerColor = simulator_setLayerColor,
   .getLayerViewport = simulator_getLayerViewport,
   .setLayerViewport = simulator_setLayerViewport,
-  .getLayerFlag = simulator_getLayerFlag,
-  .setLayerFlag = simulator_setLayerFlag,
   .getLayerTexture = simulator_getLayerTexture,
   .getLayerPass = simulator_getLayerPass,
   .getTexture = simulator_getTexture,
   .getPass = simulator_getPass,
   .submit = simulator_submit,
+  .isActive = simulator_isActive,
+  .isVisible = simulator_isVisible,
   .isFocused = simulator_isFocused,
+  .isMounted = simulator_isMounted,
   .update = simulator_update
 };

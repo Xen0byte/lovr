@@ -14,8 +14,9 @@ struct Variant;
 typedef struct Thread Thread;
 typedef struct Channel Channel;
 
-bool lovrThreadModuleInit(void);
+bool lovrThreadModuleInit(int32_t workers);
 void lovrThreadModuleDestroy(void);
+uint32_t lovrThreadGetWorkerCount(void);
 struct Channel* lovrThreadGetChannel(const char* name);
 
 // Thread
@@ -24,7 +25,7 @@ typedef char* ThreadFunction(Thread* thread, struct Blob* body, struct Variant* 
 
 Thread* lovrThreadCreate(ThreadFunction* function, struct Blob* body);
 void lovrThreadDestroy(void* ref);
-void lovrThreadStart(Thread* thread, struct Variant* arguments, uint32_t argumentCount);
+bool lovrThreadStart(Thread* thread, struct Variant* arguments, uint32_t argumentCount);
 void lovrThreadWait(Thread* thread);
 bool lovrThreadIsRunning(Thread* thread);
 const char* lovrThreadGetError(Thread* thread);

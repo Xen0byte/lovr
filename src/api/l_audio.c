@@ -93,9 +93,7 @@ static int l_lovrAudioSetDevice(lua_State *L) {
   size_t size = id ? luax_len(L, 2) : 0;
   Sound* sink = lua_isnoneornil(L, 3) ? NULL : luax_checktype(L, 3, Sound);
   AudioShareMode shareMode = luax_checkenum(L, 4, AudioShareMode, "shared");
-  bool success = lovrAudioSetDevice(type, id, size, sink, shareMode);
-  lua_pushboolean(L, success);
-  return 1;
+  return luax_pushsuccess(L, lovrAudioSetDevice(type, id, size, sink, shareMode));
 }
 
 static int l_lovrAudioStart(lua_State* L) {
@@ -200,8 +198,8 @@ static int l_lovrAudioSetGeometry(lua_State* L) {
   AudioMaterial material = luax_checkenum(L, index, AudioMaterial, "generic");
   bool success = lovrAudioSetGeometry(vertices, indices, vertexCount, indexCount, material);
   if (shouldFree) {
-    free(vertices);
-    free(indices);
+    lovrFree(vertices);
+    lovrFree(indices);
   }
   lua_pushboolean(L, success);
   return 1;
@@ -256,7 +254,7 @@ static int l_lovrAudioNewSource(lua_State* L) {
     lua_getfield(L, 2, "effects");
     if (!lua_isnil(L, -1)) {
       effects = 0;
-      lovrAssert(lua_istable(L, -1), "Source effects must be a table");
+      luax_check(L, lua_istable(L, -1), "Source effects must be a table");
       lua_pushnil(L);
       while (lua_next(L, -2) != 0) {
         if (lua_type(L, -2) == LUA_TSTRING) {
@@ -286,8 +284,9 @@ static int l_lovrAudioNewSource(lua_State* L) {
   }
 
   Source* source = lovrSourceCreate(sound, pitchable, spatial, effects);
-  luax_pushtype(L, Source, source);
   lovrRelease(sound, lovrSoundDestroy);
+  luax_assert(L, source);
+  luax_pushtype(L, Source, source);
   lovrRelease(source, lovrSourceDestroy);
   return 1;
 }
@@ -319,10 +318,6 @@ static const luaL_Reg lovrAudio[] = {
 extern const luaL_Reg lovrSource[];
 
 int luaopen_lovr_audio(lua_State* L) {
-  lua_newtable(L);
-  luax_register(L, lovrAudio);
-  luax_registertype(L, Source);
-
   bool start = true;
   const char *spatializer = NULL;
   uint32_t sampleRate = 48000; // Set default here
@@ -346,13 +341,16 @@ int luaopen_lovr_audio(lua_State* L) {
   }
   lua_pop(L, 1);
 
-  if (lovrAudioInit(spatializer, sampleRate)) {
-    luax_atexit(L, lovrAudioDestroy);
-    if (start) {
-      lovrAudioSetDevice(AUDIO_PLAYBACK, NULL, 0, NULL, AUDIO_SHARED);
-      lovrAudioStart(AUDIO_PLAYBACK);
-    }
+  luax_assert(L, lovrAudioInit(spatializer, sampleRate));
+  luax_atexit(L, lovrAudioDestroy);
+
+  if (start) {
+    lovrAudioSetDevice(AUDIO_PLAYBACK, NULL, 0, NULL, AUDIO_SHARED);
+    lovrAudioStart(AUDIO_PLAYBACK);
   }
 
+  lua_newtable(L);
+  luax_register(L, lovrAudio);
+  luax_registertype(L, Source);
   return 1;
 }

@@ -7,12 +7,19 @@
 #define MAX_EVENT_NAME_LENGTH 32
 
 struct Thread;
+struct Variant;
+
+typedef enum {
+  DISPLAY_HEADSET,
+  DISPLAY_WINDOW
+} DisplayType;
 
 typedef enum {
   EVENT_QUIT,
   EVENT_RESTART,
   EVENT_VISIBLE,
   EVENT_FOCUS,
+  EVENT_MOUNT,
   EVENT_RECENTER,
   EVENT_RESIZE,
   EVENT_KEYPRESSED,
@@ -25,6 +32,7 @@ typedef enum {
 #ifndef LOVR_DISABLE_THREAD
   EVENT_THREAD_ERROR,
 #endif
+  EVENT_FILECHANGED,
   EVENT_PERMISSION,
   EVENT_CUSTOM
 } EventType;
@@ -38,7 +46,8 @@ typedef enum {
   TYPE_POINTER,
   TYPE_OBJECT,
   TYPE_VECTOR,
-  TYPE_MATRIX
+  TYPE_MATRIX,
+  TYPE_TABLE
 } VariantType;
 
 typedef union {
@@ -65,6 +74,11 @@ typedef union {
   struct {
     float* data;
   } matrix;
+  struct {
+    struct Variant* keys;
+    struct Variant* vals;
+    size_t length;
+  } table;
 } VariantValue;
 
 typedef struct Variant {
@@ -77,8 +91,18 @@ typedef struct {
 } QuitEvent;
 
 typedef struct {
-  bool value;
-} BoolEvent;
+  bool visible;
+  DisplayType display;
+} VisibleEvent;
+
+typedef struct {
+  bool focused;
+  DisplayType display;
+} FocusEvent;
+
+typedef struct {
+  bool mounted;
+} MountEvent;
 
 typedef struct {
   uint32_t width;
@@ -115,27 +139,36 @@ typedef struct {
 } ThreadEvent;
 
 typedef struct {
-  char name[MAX_EVENT_NAME_LENGTH];
-  Variant data[4];
-  uint32_t count;
-} CustomEvent;
+  char* path;
+  char* oldpath;
+  int action;
+} FileEvent;
 
 typedef struct {
   uint32_t permission;
   bool granted;
 } PermissionEvent;
 
+typedef struct {
+  char name[MAX_EVENT_NAME_LENGTH];
+  Variant data[4];
+  uint32_t count;
+} CustomEvent;
+
 typedef union {
   QuitEvent quit;
-  BoolEvent boolean;
+  VisibleEvent visible;
+  FocusEvent focus;
+  MountEvent mount;
   ResizeEvent resize;
   KeyEvent key;
   TextEvent text;
   MouseEvent mouse;
   MouseWheelEvent wheel;
   ThreadEvent thread;
-  CustomEvent custom;
+  FileEvent file;
   PermissionEvent permission;
+  CustomEvent custom;
 } EventData;
 
 typedef struct {

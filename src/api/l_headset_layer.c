@@ -67,34 +67,53 @@ static int l_lovrLayerSetPose(lua_State* L) {
   return 0;
 }
 
-static int l_lovrLayerGetSize(lua_State* L) {
+static int l_lovrLayerGetDimensions(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
   float width, height;
-  lovrHeadsetInterface->getLayerSize(layer, &width, &height);
+  lovrHeadsetInterface->getLayerDimensions(layer, &width, &height);
   lua_pushnumber(L, width);
   lua_pushnumber(L, height);
   return 2;
 }
 
-static int l_lovrLayerSetSize(lua_State* L) {
+static int l_lovrLayerSetDimensions(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
   float width = luax_checkfloat(L, 2);
   float height = luax_checkfloat(L, 3);
-  lovrHeadsetInterface->setLayerSize(layer, width, height);
+  lovrHeadsetInterface->setLayerDimensions(layer, width, height);
   return 0;
 }
 
-static int l_lovrLayerGetViewMask(lua_State* L) {
+static int l_lovrLayerGetCurve(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
-  ViewMask mask = lovrHeadsetInterface->getLayerViewMask(layer);
-  luax_pushenum(L, ViewMask, mask);
+  float curve = lovrHeadsetInterface->getLayerCurve(layer);
+  lua_pushnumber(L, curve);
   return 1;
 }
 
-static int l_lovrLayerSetViewMask(lua_State* L) {
+static int l_lovrLayerSetCurve(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
-  ViewMask mask = luax_checkenum(L, 2, ViewMask, "both");
-  lovrHeadsetInterface->setLayerViewMask(layer, mask);
+  float curve = luax_optfloat(L, 2, 0.f);
+  luax_assert(L, lovrHeadsetInterface->setLayerCurve(layer, curve));
+  return 0;
+}
+
+static int l_lovrLayerGetColor(lua_State* L) {
+  Layer* layer = luax_checktype(L, 1, Layer);
+  float color[4];
+  lovrHeadsetInterface->getLayerColor(layer, color);
+  lua_pushnumber(L, color[0]);
+  lua_pushnumber(L, color[1]);
+  lua_pushnumber(L, color[2]);
+  lua_pushnumber(L, color[3]);
+  return 4;
+}
+
+static int l_lovrLayerSetColor(lua_State* L) {
+  Layer* layer = luax_checktype(L, 1, Layer);
+  float color[4];
+  luax_readcolor(L, 1, color);
+  lovrHeadsetInterface->setLayerColor(layer, color);
   return 0;
 }
 
@@ -120,37 +139,10 @@ static int l_lovrLayerSetViewport(lua_State* L) {
   return 0;
 }
 
-static int l_lovrLayerGetSupersample(lua_State* L) {
-  Layer* layer = luax_checktype(L, 1, Layer);
-  bool supersample = lovrHeadsetInterface->getLayerFlag(layer, LAYER_SUPERSAMPLE);
-  lua_pushboolean(L, supersample);
-  return 1;
-}
-
-static int l_lovrLayerSetSupersample(lua_State* L) {
-  Layer* layer = luax_checktype(L, 1, Layer);
-  bool supersample = lua_toboolean(L, 2);
-  lovrHeadsetInterface->setLayerFlag(layer, LAYER_SUPERSAMPLE, supersample);
-  return 0;
-}
-
-static int l_lovrLayerGetSharpen(lua_State* L) {
-  Layer* layer = luax_checktype(L, 1, Layer);
-  bool sharpen = lovrHeadsetInterface->getLayerFlag(layer, LAYER_SHARPEN);
-  lua_pushboolean(L, sharpen);
-  return 1;
-}
-
-static int l_lovrLayerSetSharpen(lua_State* L) {
-  Layer* layer = luax_checktype(L, 1, Layer);
-  bool sharpen = lua_toboolean(L, 2);
-  lovrHeadsetInterface->setLayerFlag(layer, LAYER_SHARPEN, sharpen);
-  return 0;
-}
-
 static int l_lovrLayerGetTexture(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
   struct Texture* texture = lovrHeadsetInterface->getLayerTexture(layer);
+  luax_assert(L, texture);
   luax_pushtype(L, Texture, texture);
   return 1;
 }
@@ -158,6 +150,7 @@ static int l_lovrLayerGetTexture(lua_State* L) {
 static int l_lovrLayerGetPass(lua_State* L) {
   Layer* layer = luax_checktype(L, 1, Layer);
   struct Pass* pass = lovrHeadsetInterface->getLayerPass(layer);
+  luax_assert(L, pass);
   luax_pushtype(L, Pass, pass);
   return 1;
 }
@@ -169,16 +162,14 @@ const luaL_Reg lovrLayer[] = {
   { "setOrientation", l_lovrLayerSetOrientation },
   { "getPose", l_lovrLayerGetPose },
   { "setPose", l_lovrLayerSetPose },
-  { "getSize", l_lovrLayerGetSize },
-  { "setSize", l_lovrLayerSetSize },
-  { "getViewMask", l_lovrLayerGetViewMask },
-  { "setViewMask", l_lovrLayerSetViewMask },
+  { "getDimensions", l_lovrLayerGetDimensions },
+  { "setDimensions", l_lovrLayerSetDimensions },
+  { "getCurve", l_lovrLayerGetCurve },
+  { "setCurve", l_lovrLayerSetCurve },
+  { "getColor", l_lovrLayerGetColor },
+  { "setColor", l_lovrLayerSetColor },
   { "getViewport", l_lovrLayerGetViewport },
   { "setViewport", l_lovrLayerSetViewport },
-  { "getSupersample", l_lovrLayerGetSupersample },
-  { "setSupersample", l_lovrLayerSetSupersample },
-  { "getSharpen", l_lovrLayerGetSharpen },
-  { "setSharpen", l_lovrLayerSetSharpen },
   { "getTexture", l_lovrLayerGetTexture },
   { "getPass", l_lovrLayerGetPass },
   { NULL, NULL }

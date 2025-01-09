@@ -25,10 +25,10 @@ static uint32_t nomu32(char* s, char** end) {
   return n;
 }
 
-static void parseMtl(char* path, char* base, ModelDataIO* io, arr_image_t* images, arr_material_t* materials, map_t* names) {
+static bool parseMtl(char* path, char* base, ModelDataIO* io, arr_image_t* images, arr_material_t* materials, map_t* names) {
   size_t size = 0;
   char* p = io(path, &size);
-  lovrAssert(p && size > 0, "Unable to read mtl from '%s'", path);
+  lovrAssert(p, "Unable to read mtl from '%s'", path);
   char* data = p;
 
   while (size > 0) {
@@ -39,7 +39,12 @@ static void parseMtl(char* path, char* base, ModelDataIO* io, arr_image_t* image
     char line[1024];
     size_t length = newline ? (size_t) (newline - data) : size;
     while (length > 0 && (data[length - 1] == '\r' || data[length - 1] == '\t' || data[length - 1] == ' ')) length--;
-    lovrAssert(length < sizeof(line), "OBJ MTL line length is too long (max is %d)", sizeof(line) - 1);
+
+    if (length >= sizeof(line)) {
+      lovrFree(p);
+      return lovrSetError("OBJ MTL line length is too long (max is %d)", sizeof(line) - 1);
+    }
+
     memcpy(line, data, length);
     line[length] = '\0';
 
@@ -74,25 +79,48 @@ static void parseMtl(char* path, char* base, ModelDataIO* io, arr_image_t* image
       ModelMaterial* material = &materials->data[materials->length - 1];
       memcpy(material->color, (float[4]) { r, g, b, 1.f }, 16);
     } else if (STARTS_WITH(line, "map_Kd ")) {
+      if (materials->length == 0) {
+        lovrFree(p);
+        return lovrSetError("Tried to set a material property without declaring a material first");
+      }
+
       const char* subpath = line + 7;
-      lovrAssert(subpath[0] != '/', "Absolute paths in models are not supported");
+
+      if (subpath[0] == '/') {
+        lovrFree(p);
+        return lovrSetError("Absolute paths in models are not supported");
+      }
+
       if (subpath[0] && subpath[1] && !memcmp(subpath, "./", 2)) subpath += 2;
 
-      lovrAssert(base - path + (length - 7) < 1024, "Bad OBJ: Material image filename is too long");
+      if (base - path + (length - 7) >= 1024) {
+        lovrFree(p);
+        return lovrSetError("Bad OBJ: Material image filename is too long");
+      }
+
       memcpy(base, subpath, length - 7);
       base[length - 7] = '\0';
 
       size_t imageSize = 0;
       void* pixels = io(path, &imageSize);
-      lovrAssert(pixels && imageSize > 0, "Unable to read image from %s", path);
-      Blob* blob = lovrBlobCreate(pixels, imageSize, NULL);
 
+      if (!pixels) {
+        lovrFree(p);
+        return lovrSetError("Unable to read image from %s", path);
+      }
+
+      Blob* blob = lovrBlobCreate(pixels, imageSize, NULL);
       Image* image = lovrImageCreateFromFile(blob);
-      lovrAssert(materials->length > 0, "Tried to set a material property without declaring a material first");
+      lovrRelease(blob, lovrBlobDestroy);
+
+      if (!image) {
+        lovrFree(p);
+        return false;
+      }
+
       ModelMaterial* material = &materials->data[materials->length - 1];
       material->texture = (uint32_t) images->length;
       arr_push(images, image);
-      lovrRelease(blob, lovrBlobDestroy);
     }
 
     next:
@@ -101,14 +129,26 @@ static void parseMtl(char* path, char* base, ModelDataIO* io, arr_image_t* image
     data = newline + 1;
   }
 
-  free(p);
+  lovrFree(p);
+  return true;
 }
 
-ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io) {
+bool lovrModelDataInitObj(ModelData** result, Blob* source, ModelDataIO* io) {
   if (source->size < 7 || (memcmp(source->data, "v ", 2) && memcmp(source->data, "o ", 2) && memcmp(source->data, "mtllib ", 7) && memcmp(source->data, "#", 1))) {
-    return NULL;
+    return true;
   }
 
+  char path[1024];
+  size_t pathLength = strlen(source->name);
+  lovrAssert(pathLength < sizeof(path), "OBJ filename is too long");
+  memcpy(path, source->name, pathLength);
+  path[pathLength] = '\0';
+  char* slash = strrchr(path, '/');
+  char* base = slash ? (slash + 1) : path;
+  size_t baseLength = base - path;
+  *base = '\0';
+
+  ModelData* model = NULL;
   char* data = (char*) source->data;
   size_t size = source->size;
 
@@ -123,28 +163,18 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
   arr_t(float) normals;
   arr_t(float) uvs;
 
-  arr_init(&groups, arr_alloc);
-  arr_init(&images, arr_alloc);
-  arr_init(&materials, arr_alloc);
+  arr_init(&groups);
+  arr_init(&images);
+  arr_init(&materials);
   map_init(&materialMap, 0);
-  arr_init(&vertexBlob, arr_alloc);
-  arr_init(&indexBlob, arr_alloc);
+  arr_init(&vertexBlob);
+  arr_init(&indexBlob);
   map_init(&vertexMap, 0);
-  arr_init(&positions, arr_alloc);
-  arr_init(&normals, arr_alloc);
-  arr_init(&uvs, arr_alloc);
+  arr_init(&positions);
+  arr_init(&normals);
+  arr_init(&uvs);
 
   arr_push(&groups, ((objGroup) { .material = -1 }));
-
-  char path[1024];
-  size_t pathLength = strlen(source->name);
-  lovrAssert(pathLength < sizeof(path), "OBJ filename is too long");
-  memcpy(path, source->name, pathLength);
-  path[pathLength] = '\0';
-  char* slash = strrchr(path, '/');
-  char* base = slash ? (slash + 1) : path;
-  size_t baseLength = base - path;
-  *base = '\0';
 
   while (size > 0) {
     while (size > 0 && (*data == ' ' || *data == '\t')) data++, size--;
@@ -154,7 +184,8 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
     char line[1024];
     size_t length = newline ? (size_t) (newline - data) : size;
     while (length > 0 && (data[length - 1] == '\r' || data[length - 1] == '\t' || data[length - 1] == ' ')) length--;
-    lovrAssert(length < sizeof(line), "OBJ line length is too long (max is %d)", sizeof(line) - 1);
+    lovrAssertGoto(fail, length < sizeof(line), "OBJ line length is too long (max is %d)", sizeof(line) - 1);
+
     memcpy(line, data, length);
     line[length] = '\0';
 
@@ -187,7 +218,7 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
         while (*s && (*s == ' ' || *s == '\t')) s++;
 
         if (*s == '\n') {
-          lovrAssert(i >= 3, "Bad OBJ: Face has no triangles");
+          lovrCheckGoto(fail, i >= 3, "Bad OBJ: Face has no triangles");
           break;
         }
 
@@ -197,7 +228,7 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
 
         // Triangulate faces (triangle fan)
         if (i >= 3) {
-          arr_push(&indexBlob, indexBlob.data[indexBlob.length - i]);
+          arr_push(&indexBlob, indexBlob.data[indexBlob.length - (3 * (i - 2))]);
           arr_push(&indexBlob, indexBlob.data[indexBlob.length - 2]);
           group->count += 2;
         }
@@ -216,7 +247,7 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
         uint32_t vt = 0;
         uint32_t vn = 0;
         v = nomu32(s, &s);
-        lovrAssert(v > 0, "Bad OBJ: Expected positive number for face vertex position index");
+        lovrCheckGoto(fail, v > 0, "Bad OBJ: Expected positive number for face vertex position index");
 
         // Handle v//vn, v/vt, v/vt/vtn, and v
         if (s[0] == '/') {
@@ -243,12 +274,15 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
     } else if (STARTS_WITH(line, "mtllib ")) {
       const char* filename = line + 7;
       size_t filenameLength = strlen(filename);
-      lovrAssert(filename[0] != '/', "Absolute paths in models are not supported");
+      lovrCheckGoto(fail, filename[0] != '/', "Absolute paths in models are not supported");
       if (filenameLength > 2 && !memcmp(filename, "./", 2)) filename += 2;
-      lovrAssert(baseLength + filenameLength < sizeof(path), "Bad OBJ: Material filename is too long");
+      lovrCheckGoto(fail, baseLength + filenameLength < sizeof(path), "Bad OBJ: Material filename is too long");
       memcpy(path + baseLength, filename, filenameLength);
       path[baseLength + filenameLength] = '\0';
-      parseMtl(path, base, io, &images, &materials, &materialMap);
+
+      if (!parseMtl(path, base, io, &images, &materials, &materialMap)) {
+        goto fail;
+      }
     } else if (STARTS_WITH(line, "usemtl ")) {
       uint64_t index = map_get(&materialMap, hash64(line + 7, length - 7));
       uint32_t material = index == MAP_NIL ? ~0u : index;
@@ -268,10 +302,11 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
   }
 
   if (vertexBlob.length == 0 || indexBlob.length == 0) {
-    model = NULL;
     goto finish;
   }
 
+  model = lovrCalloc(sizeof(ModelData));
+  model->ref = 1;
   model->blobCount = 2;
   model->bufferCount = 2;
   model->attributeCount = 3 + (uint32_t) groups.length;
@@ -300,8 +335,8 @@ ModelData* lovrModelDataInitObj(ModelData* model, Blob* source, ModelDataIO* io)
 
   memcpy(model->images, images.data, model->imageCount * sizeof(Image*));
   memcpy(model->materials, materials.data, model->materialCount * sizeof(ModelMaterial));
-  memcpy(model->materialMap.hashes, materialMap.hashes, materialMap.size * sizeof(uint64_t));
-  memcpy(model->materialMap.values, materialMap.values, materialMap.size * sizeof(uint64_t));
+  memcpy(((map_t*) model->materialMap)->hashes, materialMap.hashes, materialMap.size * sizeof(uint64_t));
+  memcpy(((map_t*) model->materialMap)->values, materialMap.values, materialMap.size * sizeof(uint64_t));
 
   float min[4] = { FLT_MAX };
   float max[4] = { FLT_MIN };
@@ -390,5 +425,18 @@ finish:
   arr_free(&positions);
   arr_free(&normals);
   arr_free(&uvs);
-  return model;
+  *result = model;
+  return true;
+
+fail:
+  arr_free(&groups);
+  arr_free(&images);
+  arr_free(&materials);
+  map_free(&materialMap);
+  map_free(&vertexMap);
+  arr_free(&positions);
+  arr_free(&normals);
+  arr_free(&uvs);
+  if (model) lovrModelDataDestroy(model);
+  return false;
 }

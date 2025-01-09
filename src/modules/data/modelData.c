@@ -2,6 +2,7 @@
 #include "data/blob.h"
 #include "data/image.h"
 #include "core/maf.h"
+#include "util.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -12,32 +13,31 @@ static size_t typeSizes[] = {
   [U16] = 2,
   [I32] = 4,
   [U32] = 4,
-  [F32] = 4
+  [F32] = 4,
+  [SN10x3] = 4
 };
 
 static void* nullIO(const char* path, size_t* count) {
-  lovrThrow("Can't resolve external asset reference for model loaded from memory");
+  return NULL;
 }
 
 ModelData* lovrModelDataCreate(Blob* source, ModelDataIO* io) {
-  ModelData* model = calloc(1, sizeof(ModelData));
-  lovrAssert(model, "Out of memory");
-  model->ref = 1;
+  if (!io) io = &nullIO;
 
-  if (!io) {
-    io = &nullIO;
+  ModelData* model = NULL;
+  if (!model && !lovrModelDataInitGltf(&model, source, io)) return false;
+  if (!model && !lovrModelDataInitObj(&model, source, io)) return false;
+  if (!model && !lovrModelDataInitStl(&model, source, io)) return false;
+
+  if (!model) {
+    lovrSetError("Unable to load model from '%s'", source->name);
+    return NULL;
   }
 
-  if (!lovrModelDataInitGltf(model, source, io)) {
-    if (!lovrModelDataInitObj(model, source, io)) {
-      if (!lovrModelDataInitStl(model, source, io)) {
-        lovrThrow("Unable to load model from '%s'", source->name);
-        return NULL;
-      }
-    }
+  if (!lovrModelDataFinalize(model)) {
+    lovrModelDataDestroy(model);
+    return NULL;
   }
-
-  lovrModelDataFinalize(model);
 
   return model;
 }
@@ -50,21 +50,21 @@ void lovrModelDataDestroy(void* ref) {
   for (uint32_t i = 0; i < model->imageCount; i++) {
     lovrRelease(model->images[i], lovrImageDestroy);
   }
-  map_free(&model->blendShapeMap);
-  map_free(&model->animationMap);
-  map_free(&model->materialMap);
-  map_free(&model->nodeMap);
-  free(model->vertices);
-  free(model->indices);
-  free(model->metadata);
-  free(model->data);
-  free(model);
+  map_free(model->blendShapeMap);
+  map_free(model->animationMap);
+  map_free(model->materialMap);
+  map_free(model->nodeMap);
+  lovrFree(model->vertices);
+  lovrFree(model->indices);
+  lovrFree(model->metadata);
+  lovrFree(model->data);
+  lovrFree(model);
 }
 
 // Batches allocations for all the ModelData arrays
 void lovrModelDataAllocate(ModelData* model) {
   size_t totalSize = 0;
-  size_t sizes[15];
+  size_t sizes[19];
   size_t alignment = 8;
   totalSize += sizes[0] = ALIGN(model->blobCount * sizeof(Blob*), alignment);
   totalSize += sizes[1] = ALIGN(model->bufferCount * sizeof(ModelBuffer), alignment);
@@ -80,11 +80,14 @@ void lovrModelDataAllocate(ModelData* model) {
   totalSize += sizes[11] = ALIGN(model->blendDataCount * sizeof(ModelBlendData), alignment);
   totalSize += sizes[12] = ALIGN(model->childCount * sizeof(uint32_t), alignment);
   totalSize += sizes[13] = ALIGN(model->jointCount * sizeof(uint32_t), alignment);
-  totalSize += sizes[14] = model->charCount * sizeof(char);
+  totalSize += sizes[14] = ALIGN(model->charCount * sizeof(char), alignment);
+  totalSize += sizes[15] = ALIGN(sizeof(map_t), alignment);
+  totalSize += sizes[16] = ALIGN(sizeof(map_t), alignment);
+  totalSize += sizes[17] = ALIGN(sizeof(map_t), alignment);
+  totalSize += sizes[18] = ALIGN(sizeof(map_t), alignment);
 
   size_t offset = 0;
-  char* p = model->data = calloc(1, totalSize);
-  lovrAssert(model->data, "Out of memory");
+  char* p = model->data = lovrCalloc(totalSize);
   model->blobs = (Blob**) (p + offset), offset += sizes[0];
   model->buffers = (ModelBuffer*) (p + offset), offset += sizes[1];
   model->images = (Image**) (p + offset), offset += sizes[2];
@@ -100,14 +103,18 @@ void lovrModelDataAllocate(ModelData* model) {
   model->children = (uint32_t*) (p + offset), offset += sizes[12];
   model->joints = (uint32_t*) (p + offset), offset += sizes[13];
   model->chars = (char*) (p + offset), offset += sizes[14];
+  model->blendShapeMap = (map_t*) (p + offset), offset += sizes[15];
+  model->animationMap = (map_t*) (p + offset), offset += sizes[16];
+  model->materialMap = (map_t*) (p + offset), offset += sizes[17];
+  model->nodeMap = (map_t*) (p + offset), offset += sizes[18];
 
-  map_init(&model->blendShapeMap, model->blendShapeCount);
-  map_init(&model->animationMap, model->animationCount);
-  map_init(&model->materialMap, model->materialCount);
-  map_init(&model->nodeMap, model->nodeCount);
+  map_init(model->blendShapeMap, model->blendShapeCount);
+  map_init(model->animationMap, model->animationCount);
+  map_init(model->materialMap, model->materialCount);
+  map_init(model->nodeMap, model->nodeCount);
 }
 
-void lovrModelDataFinalize(ModelData* model) {
+bool lovrModelDataFinalize(ModelData* model) {
   for (uint32_t i = 0; i < model->primitiveCount; i++) {
     model->primitives[i].skin = ~0u;
   }
@@ -130,12 +137,14 @@ void lovrModelDataFinalize(ModelData* model) {
   model->indexType = U16;
   for (uint32_t i = 0; i < model->primitiveCount; i++) {
     ModelPrimitive* primitive = &model->primitives[i];
-
     uint32_t vertexCount = primitive->attributes[ATTR_POSITION]->count;
+
     if (primitive->skin != ~0u) {
       model->skins[primitive->skin].vertexCount += vertexCount;
+      model->skins[primitive->skin].blendedVertexCount += primitive->blendShapeCount > 0 ? vertexCount : 0;
       model->skinnedVertexCount += vertexCount;
     }
+
     model->blendShapeVertexCount += vertexCount * primitive->blendShapeCount;
     model->dynamicVertexCount += primitive->skin != ~0u || !!primitive->blendShapes ? vertexCount : 0;
     model->vertexCount += vertexCount;
@@ -179,6 +188,8 @@ void lovrModelDataFinalize(ModelData* model) {
       model->nodes[node->children[j]].parent = i;
     }
   }
+
+  return true;
 }
 
 void lovrModelDataCopyAttribute(ModelData* data, ModelAttribute* attribute, char* dst, AttributeType type, uint32_t components, bool normalized, uint32_t count, size_t stride, uint8_t clear) {
@@ -239,6 +250,22 @@ void lovrModelDataCopyAttribute(ModelData* data, ModelAttribute* attribute, char
         if (components == 4 && attribute->components == 3) {
           ((uint8_t*) dst)[3] = 255;
         }
+      }
+    } else {
+      lovrUnreachable();
+    }
+  } else if (type == SN10x3) {
+    if (attribute->type == F32) {
+      for (uint32_t i = 0; i < count; i++, src += attribute->stride, dst += stride) {
+        float x = ((float*) src)[0];
+        float y = ((float*) src)[1];
+        float z = ((float*) src)[2];
+        float w = attribute->components == 4 ? ((float*) src)[3] : 0.f;
+        *(uint32_t*) dst =
+          ((((uint32_t) (int32_t) (x * 511.f)) & 0x3ff) <<  0) |
+          ((((uint32_t) (int32_t) (y * 511.f)) & 0x3ff) << 10) |
+          ((((uint32_t) (int32_t) (z * 511.f)) & 0x3ff) << 20) |
+          ((((uint32_t) (int32_t) (w * 2.f)) & 0x003) << 30);
       }
     } else {
       lovrUnreachable();
@@ -372,8 +399,7 @@ void lovrModelDataGetBoundingSphere(ModelData* model, float sphere[4]) {
     }
 
     uint32_t pointCount = totalPrimitiveCount * 8;
-    float* points = malloc(pointCount * 3 * sizeof(float));
-    lovrAssert(points, "Out of memory");
+    float* points = lovrMalloc(pointCount * 3 * sizeof(float));
 
     uint32_t pointIndex = 0;
     boundingSphereHelper(model, model->rootNode, &pointIndex, points, (float[16]) MAT4_IDENTITY);
@@ -428,7 +454,7 @@ void lovrModelDataGetBoundingSphere(ModelData* model, float sphere[4]) {
     model->boundingSphere[1] = y;
     model->boundingSphere[2] = z;
     model->boundingSphere[3] = r;
-    free(points);
+    lovrFree(points);
   }
 
   memcpy(sphere, model->boundingSphere, sizeof(model->boundingSphere));
@@ -513,8 +539,8 @@ static void collectVertices(ModelData* model, uint32_t nodeIndex, float** vertic
       *baseIndex += positions->count;
     }
 
-    if (index) {
-      lovrAssert(index->type == U16 || index->type == U32, "Unreachable");
+    if (indices && index) {
+      if (index->type != U16 && index->type != U32) lovrUnreachable();
 
       char* data = (char*) model->buffers[index->buffer].data + index->offset;
       size_t stride = index->stride == 0 ? (index->type == U16 ? 2 : 4) : index->stride;
@@ -544,20 +570,18 @@ void lovrModelDataGetTriangles(ModelData* model, float** vertices, uint32_t** in
   }
 
   if (vertices && !model->vertices) {
+    uint32_t* tempIndices;
     uint32_t baseIndex = 0;
-    model->vertices = malloc(model->totalVertexCount * 3 * sizeof(float));
-    model->indices = malloc(model->totalIndexCount * sizeof(uint32_t));
-    lovrAssert(model->vertices && model->indices, "Out of memory");
+    model->vertices = lovrMalloc(model->totalVertexCount * 3 * sizeof(float));
+    model->indices = lovrMalloc(model->totalIndexCount * sizeof(uint32_t));
     *vertices = model->vertices;
-    *indices = model->indices;
-    collectVertices(model, model->rootNode, vertices, indices, &baseIndex, (float[16]) MAT4_IDENTITY);
+    tempIndices = model->indices;
+    collectVertices(model, model->rootNode, vertices, &tempIndices, &baseIndex, (float[16]) MAT4_IDENTITY);
   }
 
-  *vertexCount = model->totalVertexCount;
-  *indexCount = model->totalIndexCount;
+  if (vertexCount) *vertexCount = model->totalVertexCount;
+  if (indexCount) *indexCount = model->totalIndexCount;
 
-  if (vertices) {
-    *vertices = model->vertices;
-    *indices = model->indices;
-  }
+  if (vertices) *vertices = model->vertices;
+  if (indices) *indices = model->indices;
 }

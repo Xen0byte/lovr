@@ -1,5 +1,13 @@
 #ifndef LOVR_USE_GLFW
 
+const char* os_get_clipboard_text(void) {
+  return NULL;
+}
+
+void os_set_clipboard_text(const char* text) {
+  //
+}
+
 void os_poll_events(void) {
   //
 }
@@ -9,6 +17,14 @@ bool os_window_open(const os_window_config* config) {
 }
 
 bool os_window_is_open(void) {
+  return false;
+}
+
+bool os_window_is_visible(void) {
+  return false;
+}
+
+bool os_window_is_focused(void) {
   return false;
 }
 
@@ -115,6 +131,7 @@ uintptr_t os_get_xcb_window(void) {
 static struct {
   GLFWwindow* window;
   fn_quit* onQuitRequest;
+  fn_visible* onWindowVisible;
   fn_focus* onWindowFocus;
   fn_resize* onWindowResize;
   fn_key* onKeyboardEvent;
@@ -133,6 +150,12 @@ static void onError(int code, const char* description) {
 static void onWindowClose(GLFWwindow* window) {
   if (glfwState.onQuitRequest) {
     glfwState.onQuitRequest();
+  }
+}
+
+static void onWindowVisible(GLFWwindow* window, int minimized) {
+  if (glfwState.onWindowVisible) {
+    glfwState.onWindowVisible(!minimized);
   }
 }
 
@@ -317,10 +340,20 @@ static int convertKey(os_key key) {
     case OS_KEY_RIGHT: return GLFW_KEY_RIGHT;
     case OS_KEY_LEFT_SHIFT: return GLFW_KEY_LEFT_SHIFT;
     case OS_KEY_RIGHT_SHIFT: return GLFW_KEY_RIGHT_SHIFT;
+    case OS_KEY_LEFT_CONTROL: return GLFW_KEY_LEFT_CONTROL;
+    case OS_KEY_RIGHT_CONTROL: return GLFW_KEY_RIGHT_CONTROL;
     case OS_KEY_ESCAPE: return GLFW_KEY_ESCAPE;
     case OS_KEY_F5: return GLFW_KEY_F5;
     default: return GLFW_KEY_UNKNOWN;
   }
+}
+
+const char* os_get_clipboard_text(void) {
+  return glfwGetClipboardString(NULL);
+}
+
+void os_set_clipboard_text(const char* text) {
+  glfwSetClipboardString(NULL, text);
 }
 
 void os_poll_events(void) {
@@ -372,6 +405,7 @@ bool os_window_open(const os_window_config* config) {
   }
 
   glfwSetWindowCloseCallback(glfwState.window, onWindowClose);
+  glfwSetWindowIconifyCallback(glfwState.window, onWindowVisible);
   glfwSetWindowFocusCallback(glfwState.window, onWindowFocus);
   glfwSetWindowSizeCallback(glfwState.window, onWindowResize);
   glfwSetKeyCallback(glfwState.window, onKeyboardEvent);
@@ -386,6 +420,14 @@ bool os_window_open(const os_window_config* config) {
 
 bool os_window_is_open(void) {
   return glfwState.window;
+}
+
+bool os_window_is_visible(void) {
+  return !glfwGetWindowAttrib(glfwState.window, GLFW_ICONIFIED);
+}
+
+bool os_window_is_focused(void) {
+  return glfwGetWindowAttrib(glfwState.window, GLFW_FOCUSED);
 }
 
 void os_window_get_size(uint32_t* width, uint32_t* height) {
@@ -406,6 +448,10 @@ float os_window_get_pixel_density(void) {
 
 void os_on_quit(fn_quit* callback) {
   glfwState.onQuitRequest = callback;
+}
+
+void os_on_visible(fn_focus* callback) {
+  glfwState.onWindowVisible = callback;
 }
 
 void os_on_focus(fn_focus* callback) {

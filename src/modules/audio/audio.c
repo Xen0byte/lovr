@@ -4,6 +4,7 @@
 #include "core/maf.h"
 #include "util.h"
 #include "lib/miniaudio/miniaudio.h"
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -41,7 +42,7 @@ struct Source {
 };
 
 static struct {
-  bool initialized;
+  uint32_t ref;
   ma_mutex lock;
   ma_context context;
   ma_device devices[2];
@@ -73,7 +74,10 @@ static float linearToDb(float linear) {
 // Device callbacks
 
 static void onPlayback(ma_device* device, void* out, const void* in, uint32_t count) {
-  lovrAssert(count == BUFFER_SIZE, "Unreachable");
+  if (count != BUFFER_SIZE) {
+    return;
+  }
+
   float raw[BUFFER_SIZE * 2];
   float aux[BUFFER_SIZE * 2];
   float mix[BUFFER_SIZE * 2];
@@ -167,7 +171,7 @@ static void onPlayback(ma_device* device, void* out, const void* in, uint32_t co
       ma_uint64 framesConsumed = count;
       ma_uint64 framesWritten = capacity;
       ma_data_converter_process_pcm_frames(&state.playbackConverter, dst, &framesConsumed, aux, &framesWritten);
-      lovrSoundWrite(state.sinks[AUDIO_PLAYBACK], 0, framesWritten, aux);
+      lovrSoundWrite(state.sinks[AUDIO_PLAYBACK], 0, framesWritten, aux, NULL);
       dst += framesConsumed * OUTPUT_CHANNELS;
       count -= framesConsumed;
     }
@@ -175,7 +179,7 @@ static void onPlayback(ma_device* device, void* out, const void* in, uint32_t co
 }
 
 static void onCapture(ma_device* device, void* output, const void* input, uint32_t count) {
-  lovrSoundWrite(state.sinks[AUDIO_CAPTURE], 0, count, input);
+  lovrSoundWrite(state.sinks[AUDIO_CAPTURE], 0, count, input, NULL);
 }
 
 static const ma_device_data_proc callbacks[] = { onPlayback, onCapture };
@@ -193,15 +197,17 @@ static Spatializer* spatializers[] = {
 // Entry
 
 bool lovrAudioInit(const char* spatializer, uint32_t sampleRate) {
-  if (state.initialized) return false;
-
-  state.sampleRate = sampleRate;
+  if (atomic_fetch_add(&state.ref, 1)) return true;
 
   ma_result result = ma_context_init(NULL, 0, NULL, &state.context);
-  lovrAssert(result == MA_SUCCESS, "Failed to initialize miniaudio");
+  lovrAssert(result == MA_SUCCESS, "Failed to initialize miniaudio context: %s", ma_result_description(result));
 
   result = ma_mutex_init(&state.lock);
-  lovrAssert(result == MA_SUCCESS, "Failed to create audio mutex");
+
+  if (result != MA_SUCCESS) {
+    ma_context_uninit(&state.context);
+    return lovrSetError("Failed to create audio mutex: %s", ma_result_description(result));
+  }
 
   for (size_t i = 0; i < COUNTOF(spatializers); i++) {
     if (spatializer && strcmp(spatializer, spatializers[i]->name)) {
@@ -213,7 +219,12 @@ bool lovrAudioInit(const char* spatializer, uint32_t sampleRate) {
       break;
     }
   }
-  lovrAssert(state.spatializer, "Must have at least one spatializer");
+
+  if (!state.spatializer) {
+    ma_context_uninit(&state.context);
+    ma_mutex_uninit(&state.lock);
+    return lovrSetError("Must have at least one spatializer");
+  }
 
   // SteamAudio's default frequency-dependent absorption coefficients for air
   state.absorption[0] = .0002f;
@@ -221,15 +232,15 @@ bool lovrAudioInit(const char* spatializer, uint32_t sampleRate) {
   state.absorption[2] = .0182f;
 
   quat_identity(state.orientation);
-
-  return state.initialized = true;
+  state.sampleRate = sampleRate;
+  return true;
 }
 
 void lovrAudioDestroy(void) {
-  if (!state.initialized) return;
+  if (atomic_fetch_sub(&state.ref, 1) != 1) return;
   for (size_t i = 0; i < 2; i++) {
     ma_device_uninit(&state.devices[i]);
-    free(state.deviceInfo[i]);
+    lovrFree(state.deviceInfo[i]);
   }
   Source* source;
   FOREACH_SOURCE(source) lovrRelease(source, lovrSourceDestroy);
@@ -267,8 +278,7 @@ bool lovrAudioGetDevice(AudioType type, AudioDevice* device) {
   }
 
   if (!state.deviceInfo[type]) {
-    state.deviceInfo[type] = malloc(sizeof(ma_device_info));
-    lovrAssert(state.deviceInfo[type], "Out of memory");
+    state.deviceInfo[type] = lovrMalloc(sizeof(ma_device_info));
   }
 
   ma_device_info* info = state.deviceInfo[type];
@@ -282,7 +292,9 @@ bool lovrAudioGetDevice(AudioType type, AudioDevice* device) {
 }
 
 bool lovrAudioSetDevice(AudioType type, void* id, size_t size, Sound* sink, AudioShareMode shareMode) {
-  if (id && size != sizeof(ma_device_id)) return false;
+  lovrAssert(!id || size == sizeof(ma_device_id), "Invalid device ID");
+  lovrCheck(!sink || lovrSoundGetChannelLayout(sink) != CHANNEL_AMBISONIC, "Ambisonic Sounds cannot be used as sinks");
+  lovrCheck(!sink || lovrSoundIsStream(sink), "Sinks must be streams");
 
   // If no sink is provided for a capture device, one is created internally
   if (type == AUDIO_CAPTURE && !sink) {
@@ -290,9 +302,6 @@ bool lovrAudioSetDevice(AudioType type, void* id, size_t size, Sound* sink, Audi
   } else {
     lovrRetain(sink);
   }
-
-  lovrAssert(!sink || lovrSoundGetChannelLayout(sink) != CHANNEL_AMBISONIC, "Ambisonic Sounds cannot be used as sinks");
-  lovrAssert(!sink || lovrSoundIsStream(sink), "Sinks must be streams");
 
   ma_device_uninit(&state.devices[type]);
   lovrRelease(state.sinks[type], lovrSoundDestroy);
@@ -310,6 +319,7 @@ bool lovrAudioSetDevice(AudioType type, void* id, size_t size, Sound* sink, Audi
     [AUDIO_EXCLUSIVE] = ma_share_mode_exclusive
   };
 
+  ma_result result;
   ma_device_config config;
 
   if (type == AUDIO_PLAYBACK) {
@@ -328,8 +338,8 @@ bool lovrAudioSetDevice(AudioType type, void* id, size_t size, Sound* sink, Audi
       converterConfig.sampleRateIn = config.sampleRate;
       converterConfig.sampleRateOut = lovrSoundGetSampleRate(sink);
       ma_data_converter_uninit(&state.playbackConverter, NULL);
-      ma_result status = ma_data_converter_init(&converterConfig, NULL, &state.playbackConverter);
-      lovrAssert(status == MA_SUCCESS, "Failed to create sink data converter");
+      result = ma_data_converter_init(&converterConfig, NULL, &state.playbackConverter);
+      lovrAssertGoto(fail, result == MA_SUCCESS, "Failed to create sink data converter: %s", ma_result_description(result));
     }
   } else {
     config = ma_device_config_init(ma_device_type_capture);
@@ -343,8 +353,13 @@ bool lovrAudioSetDevice(AudioType type, void* id, size_t size, Sound* sink, Audi
   config.periodSizeInFrames = BUFFER_SIZE;
   config.dataCallback = callbacks[type];
 
-  ma_result result = ma_device_init(&state.context, &config, &state.devices[type]);
-  return result == MA_SUCCESS;
+  result = ma_device_init(&state.context, &config, &state.devices[type]);
+  lovrAssertGoto(fail, result == MA_SUCCESS, "Failed to initialize device: %s", ma_result_description(result));
+  return true;
+fail:
+  lovrRelease(sink, lovrSoundDestroy);
+  state.sinks[type] = NULL;
+  return false;
 }
 
 bool lovrAudioStart(AudioType type) {
@@ -407,14 +422,12 @@ void lovrAudioSetAbsorption(float absorption[3]) {
 // Source
 
 Source* lovrSourceCreate(Sound* sound, bool pitchable, bool spatial, uint32_t effects) {
-  lovrAssert(lovrSoundGetChannelLayout(sound) != CHANNEL_AMBISONIC, "Ambisonic Sources are not currently supported");
-  Source* source = calloc(1, sizeof(Source));
-  lovrAssert(source, "Out of memory");
+  lovrCheck(lovrSoundGetChannelLayout(sound) != CHANNEL_AMBISONIC, "Ambisonic Sources are not currently supported");
+
+  Source* source = lovrCalloc(sizeof(Source));
   source->ref = 1;
   source->index = ~0u;
   source->sound = sound;
-  lovrRetain(source->sound);
-
   source->pitch = 1.f;
   source->volume = 1.f;
   source->pitchable = pitchable;
@@ -432,22 +445,26 @@ Source* lovrSourceCreate(Sound* sound, bool pitchable, bool spatial, uint32_t ef
   config.allowDynamicSampleRate = pitchable;
 
   if (pitchable || config.formatIn != config.formatOut || config.channelsIn != config.channelsOut || config.sampleRateIn != config.sampleRateOut) {
-    source->converter = malloc(sizeof(ma_data_converter));
-    lovrAssert(source->converter, "Out of memory");
+    source->converter = lovrMalloc(sizeof(ma_data_converter));
     ma_result status = ma_data_converter_init(&config, NULL, source->converter);
-    lovrAssert(status == MA_SUCCESS, "Problem creating Source data converter: %s (%d)", ma_result_description(status), status);
+
+    if (status != MA_SUCCESS) {
+      lovrSetError("Problem creating Source data converter: %s (%d)", ma_result_description(status), status);
+      lovrFree(source->converter);
+      lovrFree(source);
+      return NULL;
+    }
   }
 
+  lovrRetain(source->sound);
   return source;
 }
 
 Source* lovrSourceClone(Source* source) {
-  Source* clone = calloc(1, sizeof(Source));
-  lovrAssert(clone, "Out of memory");
+  Source* clone = lovrCalloc(sizeof(Source));
   clone->ref = 1;
   clone->index = ~0u;
   clone->sound = source->sound;
-  lovrRetain(clone->sound);
   clone->pitch = source->pitch;
   clone->volume = source->volume;
   vec3_init(clone->position, source->position);
@@ -459,9 +476,8 @@ Source* lovrSourceClone(Source* source) {
   clone->looping = source->looping;
   clone->pitchable = source->pitchable;
   clone->spatial = source->spatial;
+
   if (source->converter) {
-    clone->converter = malloc(sizeof(ma_data_converter));
-    lovrAssert(clone->converter, "Out of memory");
     ma_data_converter_config config = ma_data_converter_config_init_default();
     config.formatIn = source->converter->formatIn;
     config.formatOut = source->converter->formatOut;
@@ -470,9 +486,19 @@ Source* lovrSourceClone(Source* source) {
     config.sampleRateIn = source->converter->sampleRateIn;
     config.sampleRateOut = source->converter->sampleRateOut;
     config.allowDynamicSampleRate = clone->pitchable;
+
+    clone->converter = lovrMalloc(sizeof(ma_data_converter));
     ma_result status = ma_data_converter_init(&config, NULL, clone->converter);
-    lovrAssert(status == MA_SUCCESS, "Problem creating Source data converter: %s (%d)", ma_result_description(status), status);
+
+    if (status != MA_SUCCESS) {
+      lovrSetError("Problem creating Source data converter: %s (%d)", ma_result_description(status), status);
+      lovrFree(clone->converter);
+      lovrFree(clone);
+      return NULL;
+    }
   }
+
+  lovrRetain(clone->sound);
   return clone;
 }
 
@@ -480,8 +506,8 @@ void lovrSourceDestroy(void* ref) {
   Source* source = ref;
   lovrRelease(source->sound, lovrSoundDestroy);
   ma_data_converter_uninit(source->converter, NULL);
-  free(source->converter);
-  free(source);
+  lovrFree(source->converter);
+  lovrFree(source);
 }
 
 Sound* lovrSourceGetSound(Source* source) {
@@ -529,16 +555,17 @@ bool lovrSourceIsLooping(Source* source) {
   return source->looping;
 }
 
-void lovrSourceSetLooping(Source* source, bool loop) {
-  lovrAssert(loop == false || lovrSoundIsStream(source->sound) == false, "Can't loop streams");
+bool lovrSourceSetLooping(Source* source, bool loop) {
+  lovrCheck(loop == false || lovrSoundIsStream(source->sound) == false, "Can't loop streams");
   source->looping = loop;
+  return true;
 }
 
 float lovrSourceGetPitch(Source* source) {
   return source->pitch;
 }
 
-void lovrSourceSetPitch(Source* source, float pitch) {
+bool lovrSourceSetPitch(Source* source, float pitch) {
   lovrCheck(pitch > 0.f, "Source pitch must be positive");
   lovrCheck(source->pitchable, "Source must be created with the 'pitchable' flag to change its pitch");
 
@@ -549,6 +576,8 @@ void lovrSourceSetPitch(Source* source, float pitch) {
     ma_data_converter_set_rate_ratio(source->converter, pitch * ratio);
     ma_mutex_unlock(&state.lock);
   }
+
+  return true;
 }
 
 float lovrSourceGetVolume(Source* source, VolumeUnit units) {
@@ -613,13 +642,16 @@ bool lovrSourceIsEffectEnabled(Source* source, Effect effect) {
   return source->effects & (1 << effect);
 }
 
-void lovrSourceSetEffectEnabled(Source* source, Effect effect, bool enabled) {
+bool lovrSourceSetEffectEnabled(Source* source, Effect effect, bool enabled) {
   lovrCheck(source->spatial, "Sources must be created with the spatial flag to enable effects");
+
   if (enabled) {
     source->effects |= (1 << effect);
   } else {
     source->effects &= ~(1 << effect);
   }
+
+  return true;
 }
 
 intptr_t* lovrSourceGetSpatializerMemoField(Source* source) {

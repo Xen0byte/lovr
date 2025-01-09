@@ -1,104 +1,158 @@
 lovr = require 'lovr'
 
--- Note: Cannot be overloaded
-function lovr.boot()
-  local conf = {
-    version = '0.17.0',
-    identity = 'default',
-    saveprecedence = true,
-    modules = {
-      audio = true,
-      data = true,
-      event = true,
-      graphics = true,
-      headset = true,
-      math = true,
-      physics = true,
-      system = true,
-      thread = true,
-      timer = true
-    },
-    audio = {
-      start = true,
-      spatializer = nil
-    },
-    graphics = {
-      debug = false,
-      vsync = true,
-      stencil = false,
-      antialias = true,
-      shadercache = true
-    },
-    headset = {
-      drivers = { 'openxr', 'webxr', 'desktop' },
-      supersample = false,
-      offset = 1.7,
-      stencil = false,
-      antialias = true,
-      submitdepth = true,
-      overlay = false
-    },
-    math = {
-      globals = true
-    },
-    window = {
-      width = 720,
-      height = 800,
-      fullscreen = false,
-      resizable = false,
-      title = 'LÖVR',
-      icon = nil
-    }
+local lovr = lovr
+
+local conf = {
+  version = '0.17.1',
+  identity = 'default',
+  saveprecedence = true,
+  modules = {
+    audio = true,
+    data = true,
+    event = true,
+    graphics = true,
+    headset = true,
+    math = true,
+    physics = true,
+    system = true,
+    thread = true,
+    timer = true
+  },
+  audio = {
+    start = true,
+    spatializer = nil
+  },
+  graphics = {
+    debug = false,
+    vsync = true,
+    stencil = false,
+    antialias = true,
+    shadercache = true
+  },
+  headset = {
+    drivers = { 'openxr', 'webxr', 'simulator' },
+    start = true,
+    debug = false,
+    seated = false,
+    mask = true,
+    stencil = false,
+    antialias = true,
+    supersample = false,
+    submitdepth = true,
+    overlay = false,
+    controllerskeleton = 'controller'
+  },
+  math = {
+    globals = true
+  },
+  thread = {
+    workers = -1
+  },
+  window = {
+    width = 720,
+    height = 800,
+    fullscreen = false,
+    resizable = false,
+    title = 'LÖVR',
+    icon = nil
   }
+}
 
+function lovr.boot()
   lovr.filesystem = require('lovr.filesystem')
-  local main = arg[0] and arg[0]:match('[^\\/]-%.lua$') or 'main.lua'
-  local hasConf, hasMain = lovr.filesystem.isFile('conf.lua'), lovr.filesystem.isFile(main)
-  if not lovr.filesystem.getSource() or not (hasConf or hasMain) then require('nogame') end
 
-  -- Shift args up in fused mode, instead of consuming one for the source path
-  if lovr.filesystem.isFused() then
-    for i = 1, #arg + 1 do
-      arg[i] = arg[i - 1]
+  -- See if there's a ZIP archive fused to the executable, and set up the fused CLI if it exists
+
+  local bundle, root = lovr.filesystem.getBundlePath()
+  local fused = bundle and lovr.filesystem.mount(bundle, nil, true, root)
+  local cli = lovr.filesystem.isFile('arg.lua') and assert(pcall(require, 'arg')) and lovr.arg and lovr.arg(arg)
+
+  -- Implement a barebones CLI if there is no bundled CLI/project
+
+  if not fused then
+    if arg[1] and not arg[1]:match('^%-') then
+      for i = 0, #arg do
+        arg[i - 1], arg[i] = arg[i], nil
+      end
+    else
+      return function()
+        print(table.concat({
+          'usage: lovr <source>',
+          '<source> can be a Lua file, a folder with a main.lua file, or a zip archive'
+        }, '\n'))
+        return 0
+      end
     end
-    arg[0] = lovr.filesystem.getSource()
   end
 
-  local confOk, confError = true
-  if hasConf then confOk, confError = pcall(require, 'conf') end
-  if confOk and lovr.conf then confOk, confError = pcall(lovr.conf, conf) end
+  -- Figure out source archive and main module.  CLI places source at arg[0]
 
-  conf.graphics.debug = arg['--graphics-debug'] or conf.graphics.debug
+  local source, main
+  if (cli or not fused) and arg[0] then
+    if arg[0]:match('[^/\\]+%.lua$') then
+      source = arg[0]:match('[/\\]') and arg[0]:match('(.+)[/\\][^/\\]+$') or '.'
+      main = arg[0]:match('[^/\\]+%.lua$')
+    else
+      source = arg[0]
+      main = 'main.lua'
+    end
+  elseif fused then
+    source = bundle
+    main = 'main.lua'
+  end
+
+  -- Mount source archive, make sure it's got the main file, and load conf.lua
+
+  local ok, failure = true, nil
+  if source ~= bundle and not lovr.filesystem.mount(source) then
+    ok, failure = false, ('Failed to load project at %q\nMake sure the path or archive is valid.'):format(source)
+  elseif not lovr.filesystem.isFile(main) then
+    local location = source == '.' and '' or (' in %q'):format(source:match('[^/\\]+[/\\]?$'))
+    ok, failure = false, ('No %s file found%s.\nThe project may be packaged incorrectly.'):format(main, location)
+  else
+    lovr.filesystem.setSource(source)
+    if lovr.filesystem.isFile('conf.lua') then ok, failure = pcall(require, 'conf') end
+    if ok and lovr.conf then ok, failure = pcall(lovr.conf, conf) end
+  end
 
   lovr._setConf(conf)
   lovr.filesystem.setIdentity(conf.identity, conf.saveprecedence)
 
+  -- CLI gets a chance to use/modify conf and handle arguments
+
+  if ok and cli then ok, failure = pcall(cli, conf) end
+
+  -- Boot!
+
   for module in pairs(conf.modules) do
     if conf.modules[module] then
-      local ok, result = pcall(require, 'lovr.' .. module)
-      if not ok then
-        print(string.format('Warning: Could not load module %q: %s', module, result))
+      local loaded, result = pcall(require, 'lovr.' .. module)
+      if not loaded then
+        lovr.log(string.format('Could not load module %q: %s', module, result), 'warn')
       else
         lovr[module] = result
       end
     end
   end
 
-  if lovr.system and conf.window then
-    lovr.system.openWindow(conf.window)
-  end
-
   if lovr.graphics then
     lovr.graphics.initialize()
   end
 
-  if lovr.headset then
-    lovr.headset.start()
+  if lovr.system and conf.window then
+    lovr.system.openWindow(conf.window)
   end
 
-  lovr.handlers = setmetatable({}, { __index = lovr })
-  if not confOk then error(confError) end
-  if hasMain then require(main:gsub('%.lua$', '')) end
+  if lovr.headset and conf.headset.start then
+    assert(lovr.headset.start())
+  end
+
+  if not ok and failure then
+    error(failure)
+  end
+
+  require(main:sub(1, -5))
+
   return lovr.run()
 end
 
@@ -116,7 +170,7 @@ function lovr.run()
     end
     local dt = 0
     if lovr.timer then dt = lovr.timer.step() end
-    if lovr.headset then dt = lovr.headset.update() end
+    if lovr.headset and lovr.headset.isActive() then dt = lovr.headset.update() end
     if lovr.update then lovr.update(dt) end
     if lovr.graphics then
       local headset = lovr.headset and lovr.headset.getPass()
@@ -132,7 +186,7 @@ function lovr.run()
 end
 
 function lovr.mirror(pass)
-  if lovr.headset then
+  if lovr.headset and lovr.headset.isActive() then
     local texture = lovr.headset.getTexture()
     if texture then
       pass:fill(texture)
@@ -147,7 +201,7 @@ local function formatTraceback(s)
 end
 
 function lovr.errhand(message)
-  message = 'Error:\n\n' .. tostring(message) .. formatTraceback(debug.traceback('', 4))
+  message = 'Error:\n\n' .. tostring(message) .. formatTraceback(debug and debug.traceback('', 4) or '')
 
   print(message)
 
@@ -163,6 +217,10 @@ function lovr.errhand(message)
     lovr.graphics.setBackgroundColor(0, 0, 0, 0)
   end
 
+  if lovr.headset then
+    lovr.headset.setLayers()
+  end
+
   local font = lovr.graphics.getDefaultFont()
 
   return function()
@@ -172,10 +230,11 @@ function lovr.errhand(message)
       if name == 'quit' then return a or 1
       elseif name == 'restart' then return 'restart', lovr.restart and lovr.restart()
       elseif name == 'keypressed' and a == 'f5' then lovr.event.restart()
+      elseif name == 'filechanged' then lovr.event.restart()
       elseif name == 'keypressed' and a == 'escape' then lovr.event.quit() end
     end
 
-    if lovr.headset and lovr.headset.getDriver() ~= 'desktop' then
+    if lovr.headset and lovr.headset.getDriver() ~= 'simulator' then
       lovr.headset.update()
       local pass = lovr.headset.getPass()
       if pass then
@@ -185,7 +244,9 @@ function lovr.errhand(message)
         local font = lovr.graphics.getDefaultFont()
         local wrap = .7 * font:getPixelDensity()
         local lines = font:getLines(message, wrap)
-        local width = math.min(font:getWidth(message), wrap) * scale
+        local maxWidth = 0
+        for i, line in ipairs(lines) do maxWidth = math.max(maxWidth, font:getWidth(line)) end
+        local width = maxWidth * scale
         local height = .8 + #lines * font:getHeight() * scale
         local x = -width / 2
         local y = math.min(height / 2, 10)
@@ -203,12 +264,15 @@ function lovr.errhand(message)
       local pass = lovr.graphics.getWindowPass()
       if pass then
         local w, h = lovr.system.getWindowDimensions()
-        pass:setProjection(1, lovr.math.mat4():orthographic(0, w, 0, h, -1, 1))
+        pass:setProjection(1, lovr.math.mat4():orthographic(w, h))
         font:setPixelDensity(1)
 
         local scale = .6
         local wrap = w * .8 / scale
-        local width = math.min(font:getWidth(message), wrap) * scale
+        local lines = font:getLines(message, wrap)
+        local maxWidth = 0
+        for i, line in ipairs(lines) do maxWidth = math.max(maxWidth, font:getWidth(line)) end
+        local width = maxWidth * scale
         local x = w / 2 - width / 2
 
         pass:setColor(.95, .95, .95)
@@ -227,42 +291,41 @@ function lovr.threaderror(thread, err)
   error('Thread error\n\n' .. err, 0)
 end
 
+function lovr.filechanged(path, action, oldpath)
+  if not path:match('^%.') then
+    lovr.event.restart()
+  end
+end
+
 function lovr.log(message, level, tag)
   message = message:gsub('\n$', '')
   print(message)
 end
 
-return function()
-  local errored = false
+lovr.handlers = setmetatable({}, { __index = lovr })
 
+return coroutine.create(function()
   local function onerror(...)
-    if not errored then
-      errored = true -- Ensure errhand is only called once
-      return lovr.errhand(...) or function() return 1 end
-    else
-      local message = tostring(...) .. formatTraceback(debug.traceback('', 2))
-      print('Error occurred while trying to display another error:\n' .. message)
+    onerror = function(...)
+      print('Error:\n\n' .. tostring(...) .. formatTraceback(debug and debug.traceback('', 1) or ''))
       return function() return 1 end
+    end
+
+    local ok, result = pcall(lovr.errhand or onerror, ...)
+
+    if ok then
+      return result or function() return 1 end
+    else
+      return onerror(result)
     end
   end
 
-  -- thread will be either lovr.run's step function, or the result of errhand
-  local _, thread = xpcall(lovr.boot, onerror)
+  local thread = select(2, xpcall(lovr.boot, onerror))
 
   while true do
     local ok, result, cookie = xpcall(thread, onerror)
-
-    -- If step function returned something, exit coroutine and return to C
-    if result and ok then
-      return result, cookie
-    elseif not ok then -- Switch to errhand loop
-      thread = result
-      if type(thread) ~= 'function' then
-        print('Error occurred while trying to display another error:\n' .. tostring(result))
-        return 1
-      end
-    end
-
+    if not ok then thread = result
+    elseif result then return result, cookie end
     coroutine.yield()
   end
-end
+end)

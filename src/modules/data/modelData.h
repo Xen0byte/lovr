@@ -1,4 +1,3 @@
-#include "util.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -33,7 +32,7 @@ typedef enum {
   MAX_DEFAULT_ATTRIBUTES
 } DefaultAttribute;
 
-typedef enum { I8, U8, I16, U16, I32, U32, F32 } AttributeType;
+typedef enum { I8, U8, I16, U16, I32, U32, F32, SN10x3 } AttributeType;
 
 typedef union {
   void* raw;
@@ -149,6 +148,7 @@ typedef struct {
   uint32_t* joints;
   uint32_t jointCount;
   uint32_t vertexCount;
+  uint32_t blendedVertexCount;
   float* inverseBindMatrices;
 } ModelSkin;
 
@@ -234,21 +234,21 @@ typedef struct ModelData {
 
   // Lookups
 
-  map_t blendShapeMap;
-  map_t animationMap;
-  map_t materialMap;
-  map_t nodeMap;
+  void* blendShapeMap;
+  void* animationMap;
+  void* materialMap;
+  void* nodeMap;
 } ModelData;
 
 typedef void* ModelDataIO(const char* filename, size_t* bytesRead);
 
 ModelData* lovrModelDataCreate(struct Blob* blob, ModelDataIO* io);
-ModelData* lovrModelDataInitGltf(ModelData* model, struct Blob* blob, ModelDataIO* io);
-ModelData* lovrModelDataInitObj(ModelData* model, struct Blob* blob, ModelDataIO* io);
-ModelData* lovrModelDataInitStl(ModelData* model, struct Blob* blob, ModelDataIO* io);
+bool lovrModelDataInitGltf(ModelData** model, struct Blob* blob, ModelDataIO* io);
+bool lovrModelDataInitObj(ModelData** model, struct Blob* blob, ModelDataIO* io);
+bool lovrModelDataInitStl(ModelData** model, struct Blob* blob, ModelDataIO* io);
 void lovrModelDataDestroy(void* ref);
 void lovrModelDataAllocate(ModelData* model);
-void lovrModelDataFinalize(ModelData* model);
+bool lovrModelDataFinalize(ModelData* model);
 void lovrModelDataCopyAttribute(ModelData* data, ModelAttribute* attribute, char* dst, AttributeType type, uint32_t components, bool normalized, uint32_t count, size_t stride, uint8_t clear);
 void lovrModelDataGetBoundingBox(ModelData* data, float box[6]);
 void lovrModelDataGetBoundingSphere(ModelData* data, float sphere[4]);

@@ -63,6 +63,10 @@ layout(set = 1, binding = 4) uniform texture2D RoughnessTexture;
 layout(set = 1, binding = 5) uniform texture2D ClearcoatTexture;
 layout(set = 1, binding = 6) uniform texture2D OcclusionTexture;
 layout(set = 1, binding = 7) uniform texture2D NormalTexture;
+
+layout(push_constant) uniform PushConstants {
+  uint DrawID;
+};
 #endif
 
 // Attributes
@@ -71,7 +75,7 @@ layout(location = 10) in vec4 VertexPosition;
 layout(location = 11) in vec3 VertexNormal;
 layout(location = 12) in vec2 VertexUV;
 layout(location = 13) in vec4 VertexColor;
-layout(location = 14) in vec3 VertexTangent;
+layout(location = 14) in vec4 VertexTangent;
 #endif
 
 // Framebuffer
@@ -85,7 +89,7 @@ layout(location = 10) out vec3 PositionWorld;
 layout(location = 11) out vec3 Normal;
 layout(location = 12) out vec2 UV;
 layout(location = 13) out vec4 Color;
-layout(location = 14) out vec3 Tangent;
+layout(location = 14) out vec4 Tangent;
 #endif
 
 #ifdef GL_FRAGMENT_SHADER
@@ -93,7 +97,7 @@ layout(location = 10) in vec3 PositionWorld;
 layout(location = 11) in vec3 Normal;
 layout(location = 12) in vec2 UV;
 layout(location = 13) in vec4 Color;
-layout(location = 14) in vec3 Tangent;
+layout(location = 14) in vec4 Tangent;
 #endif
 
 // Builtins
@@ -116,7 +120,7 @@ layout(location = 14) in vec3 Tangent;
 #define BaseInstance gl_BaseInstance
 #define BaseVertex gl_BaseVertex
 #define DrawIndex gl_DrawIndex
-#define InstanceIndex (gl_InstanceIndex - gl_BaseInstance)
+#define InstanceIndex gl_InstanceIndex
 #define PointSize gl_PointSize
 #define Position gl_Position
 #define VertexIndex gl_VertexIndex
@@ -140,12 +144,7 @@ layout(location = 14) in vec3 Tangent;
 
 // Helpers
 
-#define Constants layout(push_constant) uniform PushConstants
-#ifdef GL_COMPUTE_SHADER
-#define var(x) layout(set = 0, binding = x)
-#else
-#define var(x) layout(set = 2, binding = x)
-#endif
+#define Constants uniform DefaultUniformBlock
 
 #ifndef GL_COMPUTE_SHADER
 #define Projection Cameras[ViewIndex].projection
@@ -156,7 +155,6 @@ layout(location = 14) in vec3 Tangent;
 #endif
 
 #ifdef GL_VERTEX_SHADER
-#define DrawID gl_BaseInstance
 #define Transform mat4(Draws[DrawID].transform)
 #define NormalMatrix (cofactor3(Draws[DrawID].transform))
 #define PassColor Draws[DrawID].color
@@ -196,6 +194,13 @@ vec4 getPixel(texture2D t, vec2 uv) { return texture(sampler2D(t, Sampler), uv);
 vec4 getPixel(texture3D t, vec3 uvw) { return texture(sampler3D(t, Sampler), uvw); }
 vec4 getPixel(textureCube t, vec3 dir) { return texture(samplerCube(t, Sampler), dir); }
 vec4 getPixel(texture2DArray t, vec2 uv, float layer) { return texture(sampler2DArray(t, Sampler), vec3(uv, layer)); }
+vec4 getPixel(textureCubeArray t, vec4 coord) { return texture(samplerCubeArray(t, Sampler), coord); }
+
+vec4 getPixel(sampler2D t, vec2 uv) { return texture(t, uv); }
+vec4 getPixel(sampler3D t, vec3 uvw) { return texture(t, uvw); }
+vec4 getPixel(samplerCube t, vec3 dir) { return texture(t, dir); }
+vec4 getPixel(sampler2DArray t, vec2 uv, float layer) { return texture(t, vec3(uv, layer)); }
+vec4 getPixel(samplerCubeArray t, vec4 coord) { return texture(t, coord); }
 #endif
 
 #ifdef GL_FRAGMENT_SHADER
@@ -227,8 +232,8 @@ struct Surface {
 mat3 getTangentMatrix() {
   if (flag_vertexTangents) {
     vec3 N = normalize(Normal);
-    vec3 T = normalize(Tangent);
-    vec3 B = cross(N, T);
+    vec3 T = normalize(Tangent.xyz);
+    vec3 B = cross(N, T) * Tangent.w;
     return mat3(T, B, N);
   } else {
     // http://www.thetenthplanet.de/archives/1180
@@ -342,7 +347,7 @@ void initSurface(out Surface surface) {
 }
 
 float D_GGX(const Surface surface, float NoH) {
-  float alpha2 = surface.roughness * surface.roughness2;
+  float alpha2 = surface.roughness2 * surface.roughness2;
   float denom = (NoH * NoH) * (alpha2 - 1.) + 1.;
   return alpha2 / (PI * denom * denom);
 }
@@ -443,6 +448,24 @@ vec3 linearToGamma(vec3 color) {
   return mix(1.055 * pow(color, vec3(1. / 2.4)) - .055, color * 12.92, lessThanEqual(color, vec3(.0031308)));
 }
 
+uint packSnorm10x3(vec4 v) {
+  return
+    ((int(v.x * 511.) & 0x3ff) <<  0) |
+    ((int(v.y * 511.) & 0x3ff) << 10) |
+    ((int(v.z * 511.) & 0x3ff) << 20) |
+    ((int(v.w * 2.) & 0x3) << 30);
+}
+
+// The weird 22 bit shift basically does sign-extension of a 10-bit value stored in a 32-bit int
+vec4 unpackSnorm10x3(uint n) {
+  return vec4(
+    max((int((n >> 0)  & 0x3ff) << 22 >> 22) / 511., -1.),
+    max((int((n >> 10) & 0x3ff) << 22 >> 22) / 511., -1.),
+    max((int((n >> 20) & 0x3ff) << 22 >> 22) / 511., -1.),
+    max(float((n >> 30) & 0x3), -1.)
+  );
+}
+
 // Entrypoints
 #ifndef NO_DEFAULT_MAIN
 #ifdef GL_VERTEX_SHADER
@@ -458,7 +481,7 @@ void main() {
   if (flag_vertexColors) Color *= VertexColor;
 
   if (flag_vertexTangents) {
-    Tangent = NormalMatrix * VertexTangent;
+    Tangent = vec4(NormalMatrix * VertexTangent.xyz, VertexTangent.w);
   }
 
   PointSize = flag_pointSize;
@@ -488,8 +511,10 @@ void main() {
     PixelColor.rgb = tonemap(PixelColor.rgb);
   }
 
-  if (flag_alphaCutoff && PixelColor.a <= Material.alphaCutoff) {
-    discard;
+  if (flag_alphaCutoff) { // Nesting the ifs instead of using && to work around a glslang bug
+    if (PixelColor.a <= Material.alphaCutoff) {
+      discard;
+    }
   }
 }
 #endif

@@ -1,6 +1,7 @@
 #include "api.h"
 #include "math/math.h"
 #include "util.h"
+#include <threads.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,14 +32,15 @@ extern const luaL_Reg lovrVec4[];
 extern const luaL_Reg lovrQuat[];
 extern const luaL_Reg lovrMat4[];
 
-static LOVR_THREAD_LOCAL Pool* pool;
+static thread_local Pool* pool;
+static thread_local int metaref[MAX_VECTOR_TYPES];
 
-static struct { const char* name; lua_CFunction constructor, indexer; const luaL_Reg* api; int metaref; } lovrVectorInfo[] = {
-  [V_VEC2] = { "vec2", l_lovrMathVec2, l_lovrVec2__metaindex, lovrVec2, LUA_REFNIL },
-  [V_VEC3] = { "vec3", l_lovrMathVec3, l_lovrVec3__metaindex, lovrVec3, LUA_REFNIL },
-  [V_VEC4] = { "vec4", l_lovrMathVec4, l_lovrVec4__metaindex, lovrVec4, LUA_REFNIL },
-  [V_QUAT] = { "quat", l_lovrMathQuat, l_lovrQuat__metaindex, lovrQuat, LUA_REFNIL },
-  [V_MAT4] = { "mat4", l_lovrMathMat4, l_lovrMat4__metaindex, lovrMat4, LUA_REFNIL }
+static struct { const char* name; lua_CFunction constructor, indexer; const luaL_Reg* api; } lovrVectorInfo[] = {
+  [V_VEC2] = { "vec2", l_lovrMathVec2, l_lovrVec2__metaindex, lovrVec2 },
+  [V_VEC3] = { "vec3", l_lovrMathVec3, l_lovrVec3__metaindex, lovrVec3 },
+  [V_VEC4] = { "vec4", l_lovrMathVec4, l_lovrVec4__metaindex, lovrVec4 },
+  [V_QUAT] = { "quat", l_lovrMathQuat, l_lovrQuat__metaindex, lovrQuat },
+  [V_MAT4] = { "mat4", l_lovrMathMat4, l_lovrMat4__metaindex, lovrMat4 }
 };
 
 static void luax_destroypool(void) {
@@ -53,7 +55,9 @@ float* luax_tovector(lua_State* L, int index, VectorType* type) {
       Vector v = { .pointer = p };
       if (v.handle.type > V_NONE && v.handle.type < MAX_VECTOR_TYPES) {
         if (type) *type = v.handle.type;
-        return lovrPoolResolve(pool, v);
+        float* pointer = lovrPoolResolve(pool, v);
+        luax_assert(L, pointer);
+        return pointer;
       }
     } else {
       VectorType* t = p;
@@ -78,7 +82,7 @@ float* luax_checkvector(lua_State* L, int index, VectorType type, const char* ex
 static float* luax_newvector(lua_State* L, VectorType type, size_t components) {
   VectorType* p = lua_newuserdata(L, sizeof(VectorType) + components * sizeof(float));
   *p = type;
-  lua_rawgeti(L, LUA_REGISTRYINDEX, lovrVectorInfo[type].metaref);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, metaref[type]);
   lua_setmetatable(L, -2);
   return (float*) (p + 1);
 }
@@ -86,6 +90,7 @@ static float* luax_newvector(lua_State* L, VectorType type, size_t components) {
 float* luax_newtempvector(lua_State* L, VectorType type) {
   float* data;
   Vector vector = lovrPoolAllocate(pool, type, &data);
+  luax_assert(L, vector.handle.type != V_NONE);
   lua_pushlightuserdata(L, vector.pointer);
   return data;
 }
@@ -110,7 +115,7 @@ static int l_lovrMathNewCurve(lua_State* L) {
   } else if (top == 1 && lua_type(L, 1) == LUA_TNUMBER) {
     float point[4] = { 0.f };
     int count = lua_tonumber(L, 1);
-    lovrAssert(count > 0, "Number of curve points must be positive");
+    luax_check(L, count > 0, "Number of curve points must be positive");
     for (int i = 0; i < count; i++) {
       lovrCurveAddPoint(curve, point, i);
     }
@@ -302,7 +307,7 @@ static int l_lovrLightUserdata__index(lua_State* L) {
     return 0;
   }
 
-  lua_rawgeti(L, LUA_REGISTRYINDEX, lovrVectorInfo[type].metaref);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, metaref[type]);
   lua_pushvalue(L, 2);
   lua_rawget(L, -2);
   if (lua_isnil(L, -1)) {
@@ -331,10 +336,11 @@ static int l_lovrLightUserdataOp(lua_State* L) {
       return 1;
     }
     lua_pop(L, 1);
-    return luaL_error(L, "Unsupported lightuserdata operator %q", lua_tostring(L, lua_upvalueindex(1)));
+    luaL_error(L, "Unsupported lightuserdata operator %q", lua_tostring(L, lua_upvalueindex(1)));
+    return 0;
   }
 
-  lua_rawgeti(L, LUA_REGISTRYINDEX, lovrVectorInfo[type].metaref);
+  lua_rawgeti(L, LUA_REGISTRYINDEX, metaref[type]);
   lua_pushvalue(L, lua_upvalueindex(1));
   lua_gettable(L, -2);
   lua_pushvalue(L, 1);
@@ -369,7 +375,7 @@ int luaopen_lovr_math(lua_State* L) {
     lua_settable(L, -4);
 
     luax_register(L, lovrVectorInfo[i].api);
-    lovrVectorInfo[i].metaref = luaL_ref(L, LUA_REGISTRYINDEX);
+    metaref[i] = luaL_ref(L, LUA_REGISTRYINDEX);
   }
 
   // Global lightuserdata metatable
@@ -387,9 +393,8 @@ int luaopen_lovr_math(lua_State* L) {
   lua_pop(L, 1);
 
   // Module
-  if (lovrMathInit()) {
-    luax_atexit(L, lovrMathDestroy);
-  }
+  lovrMathInit();
+  luax_atexit(L, lovrMathDestroy);
 
   // Each Lua state gets its own thread-local Pool
   pool = lovrPoolCreate();

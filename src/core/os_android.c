@@ -200,6 +200,7 @@ uint32_t os_get_core_count(void) {
 // To make regular printing work, a thread makes a pipe and redirects stdout and stderr to the write
 // end of the pipe.  The read end of the pipe is forwarded to __android_log_write.
 static struct {
+  bool attached;
   int handles[2];
   pthread_t thread;
 } log;
@@ -221,8 +222,11 @@ static void* log_main(void* data) {
 }
 
 void os_open_console(void) {
-  pthread_create(&log.thread, NULL, log_main, log.handles);
-  pthread_detach(log.thread);
+  if (!log.attached) {
+    pthread_create(&log.thread, NULL, log_main, log.handles);
+    pthread_detach(log.thread);
+    log.attached = true;
+  }
 }
 
 #define NS_PER_SEC 1000000000ULL
@@ -265,6 +269,14 @@ void os_request_permission(os_permission permission) {
   }
 }
 
+const char* os_get_clipboard_text(void) {
+  return NULL;
+}
+
+void os_set_clipboard_text(const char* text) {
+  //
+}
+
 void* os_vm_init(size_t size) {
   return mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
@@ -290,33 +302,24 @@ void os_thread_detach(void) {
   (*state.app->activity->vm)->DetachCurrentThread(state.app->activity->vm);
 }
 
-// Notes about polling:
-// - Stop polling if a destroy is requested to give the application a chance to shut down.
-//   Otherwise this loop would still wait for an event and the app would seem unresponsive.
-// - Block if the app is paused or no window is present
-// - If the app was active and becomes inactive after an event, break instead of waiting for
-//   another event.  This gives the main loop a chance to respond (e.g. exit VR mode).
 void os_poll_events(void) {
-  while (!state.app->destroyRequested) {
-    int events;
+  if (!state.app->destroyRequested) {
     struct android_poll_source* source;
     int timeout = (state.app->window && state.app->activityState == APP_CMD_RESUME) ? 0 : -1;
-    if (ALooper_pollAll(timeout, NULL, &events, (void**) &source) >= 0) {
-      if (source) {
-        source->process(state.app, source);
-      }
+    ALooper_pollOnce(timeout, NULL, NULL, (void**) &source);
 
-      if (timeout == 0 && (!state.app->window || state.app->activityState != APP_CMD_RESUME)) {
-        break;
-      }
-    } else {
-      break;
+    if (source) {
+      source->process(state.app, source);
     }
   }
 }
 
 void os_on_quit(fn_quit* callback) {
   state.onQuit = callback;
+}
+
+void os_on_visible(fn_visible* callback) {
+  //
 }
 
 void os_on_focus(fn_focus* callback) {
@@ -356,6 +359,14 @@ bool os_window_open(const os_window_config* config) {
 }
 
 bool os_window_is_open(void) {
+  return false;
+}
+
+bool os_window_is_visible(void) {
+  return false;
+}
+
+bool os_window_is_focused(void) {
   return false;
 }
 

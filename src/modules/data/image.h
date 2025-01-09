@@ -24,6 +24,7 @@ typedef enum {
   FORMAT_RGB10A2,
   FORMAT_RG11B10F,
   FORMAT_D16,
+  FORMAT_D24,
   FORMAT_D32F,
   FORMAT_D24S8,
   FORMAT_D32FS8,
@@ -57,7 +58,7 @@ typedef void MapPixelCallback(void* userdata, uint32_t x, uint32_t y, float pixe
 
 typedef struct Image Image;
 
-Image* lovrImageCreateRaw(uint32_t width, uint32_t height, TextureFormat format);
+Image* lovrImageCreateRaw(uint32_t width, uint32_t height, TextureFormat format, bool srgb);
 Image* lovrImageCreateFromFile(struct Blob* blob);
 void lovrImageDestroy(void* ref);
 bool lovrImageIsSRGB(Image* image);
@@ -73,9 +74,8 @@ uint32_t lovrImageGetLevelCount(Image* image);
 TextureFormat lovrImageGetFormat(Image* image);
 size_t lovrImageGetLayerSize(Image* image, uint32_t level);
 void* lovrImageGetLayerData(Image* image, uint32_t level, uint32_t layer);
-void lovrImageGetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]);
-void lovrImageSetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]);
-void lovrImageMapPixel(Image* image, uint32_t x, uint32_t y, uint32_t w, uint32_t h, MapPixelCallback* callback, void* userdata);
-void lovrImageCopy(Image* src, Image* dst, uint32_t srcOffset[2], uint32_t dstOffset[2], uint32_t extent[2]);
-void lovrImageClear(Image* image);
+bool lovrImageGetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]);
+bool lovrImageSetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]);
+bool lovrImageMapPixel(Image* image, uint32_t x, uint32_t y, uint32_t w, uint32_t h, MapPixelCallback* callback, void* userdata);
+bool lovrImageCopy(Image* src, Image* dst, uint32_t srcOffset[2], uint32_t dstOffset[2], uint32_t extent[2]);
 struct Blob* lovrImageEncode(Image* image);

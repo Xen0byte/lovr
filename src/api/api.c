@@ -1,8 +1,6 @@
 #include "api.h"
 #include "util.h"
-#include "lib/lua/lutf8lib.h"
-#include <lua.h>
-#include <lauxlib.h>
+#include "lib/luax/lutf8lib.h"
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -35,9 +33,11 @@ LOVR_EXPORT int luaopen_lovr_timer(lua_State* L);
 
 // Object names are lightuserdata because Variants need a non-Lua string due to threads.
 static int luax_meta__tostring(lua_State* L) {
-  lua_getfield(L, -1, "__info");
+  lua_getfield(L, 1, "__info");
   TypeInfo* info = lua_touserdata(L, -1);
-  lua_pushstring(L, info->name);
+  lua_pop(L, 1);
+  Proxy* p = lua_touserdata(L, 1);
+  lua_pushfstring(L, "%s: %p", info->name, p->object);
   return 1;
 }
 
@@ -152,6 +152,10 @@ void _luax_registertype(lua_State* L, const char* name, const luaL_Reg* function
   lua_pushcfunction(L, luax_meta__gc);
   lua_setfield(L, -2, "__gc");
 
+  // m.__close = gc
+  lua_pushcfunction(L, luax_meta__gc);
+  lua_setfield(L, -2, "__close");
+
   // m.__tostring
   lua_pushcfunction(L, luax_meta__tostring);
   lua_setfield(L, -2, "__tostring");
@@ -203,7 +207,8 @@ int luax_typeerror(lua_State* L, int index, const char* expected) {
     name = luaL_typename(L, index);
   }
   const char* message = lua_pushfstring(L, "%s expected, got %s", expected, name);
-  return luaL_argerror(L, index, message);
+  luaL_argerror(L, index, message);
+  return 0;
 }
 
 // Registers the userdata on the top of the stack in the registry.
@@ -271,10 +276,12 @@ int _luax_checkenum(lua_State* L, int index, const StringEntry* map, const char*
   }
 
   if (index > 0) {
-    return luaL_argerror(L, index, lua_pushfstring(L, "invalid %s '%s'", label, string));
+    luaL_argerror(L, index, lua_pushfstring(L, "invalid %s '%s'", label, string));
   } else {
-    return luaL_error(L, "invalid %s '%s'", label, string);
+    luaL_error(L, "invalid %s '%s'", label, string);
   }
+
+  return 0;
 }
 
 void luax_registerloader(lua_State* L, lua_CFunction loader, int index) {
@@ -376,16 +383,45 @@ int luax_getstack(lua_State *L) {
   return 1;
 }
 
+int luax_pushsuccess(lua_State* L, bool success) {
+  if (success) {
+    lua_pushboolean(L, true);
+    return 1;
+  } else {
+    lua_pushboolean(L, false);
+    lua_pushstring(L, lovrGetError());
+    return 2;
+  }
+}
+
 void luax_pushconf(lua_State* L) {
   lua_getfield(L, LUA_REGISTRYINDEX, "_lovrconf");
 }
 
 int luax_setconf(lua_State* L) {
   luax_pushconf(L);
-  lovrAssert(lua_isnil(L, -1), "Unable to set lovr.conf multiple times");
+  luax_check(L, lua_isnil(L, -1), "Unable to set lovr.conf multiple times");
   lua_pop(L, 1);
   lua_setfield(L, LUA_REGISTRYINDEX, "_lovrconf");
   return 0;
+}
+
+void luax_pushstash(lua_State* L, const char* name) {
+  lua_getfield(L, LUA_REGISTRYINDEX, name);
+
+  if (lua_isnil(L, -1)) {
+    lua_newtable(L);
+    lua_replace(L, -2);
+
+    // metatable
+    lua_newtable(L);
+    lua_pushliteral(L, "k");
+    lua_setfield(L, -2, "__mode");
+    lua_setmetatable(L, -2);
+
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, name);
+  }
 }
 
 void luax_setmainthread(lua_State *L) {
@@ -505,25 +541,19 @@ void luax_optcolor(lua_State* L, int index, float color[4]) {
         break;
       }
     } /* fallthrough */
-    default: lovrThrow("Expected nil, number, table, vec3, or vec4 for color value");
+    default: luaL_error(L, "Expected nil, number, table, vec3, or vec4 for color value");
   }
 }
 
 int luax_readmesh(lua_State* L, int index, float** vertices, uint32_t* vertexCount, uint32_t** indices, uint32_t* indexCount, bool* shouldFree) {
   if (lua_istable(L, index)) {
-    luaL_checktype(L, index + 1, LUA_TTABLE);
     lua_rawgeti(L, index, 1);
     bool nested = lua_type(L, -1) == LUA_TTABLE;
     lua_pop(L, 1);
 
     *vertexCount = luax_len(L, index) / (nested ? 1 : 3);
-    *indexCount = luax_len(L, index + 1);
-    lovrAssert(*vertexCount > 0, "Invalid mesh data: vertex count is zero");
-    lovrAssert(*indexCount > 0, "Invalid mesh data: index count is zero");
-    lovrAssert(*indexCount % 3 == 0, "Index count must be a multiple of 3");
-    *vertices = malloc(sizeof(float) * *vertexCount * 3);
-    *indices = malloc(sizeof(uint32_t) * *indexCount);
-    lovrAssert(vertices && indices, "Out of memory");
+    luax_check(L, *vertexCount > 0, "Invalid mesh data: vertex count is zero");
+    *vertices = lovrMalloc(sizeof(float) * *vertexCount * 3);
     *shouldFree = true;
 
     if (nested) {
@@ -545,15 +575,31 @@ int luax_readmesh(lua_State* L, int index, float** vertices, uint32_t* vertexCou
       }
     }
 
-    for (uint32_t i = 0; i < *indexCount; i++) {
-      lua_rawgeti(L, index + 1, i + 1);
-      uint32_t index = luaL_checkinteger(L, -1) - 1;
-      lovrAssert(index < *vertexCount, "Invalid vertex index %d (expected [%d, %d])", index + 1, 1, *vertexCount);
-      (*indices)[i] = index;
-      lua_pop(L, 1);
+    if (indices) {
+      luaL_checktype(L, index + 1, LUA_TTABLE);
+      *indexCount = luax_len(L, index + 1);
+      luax_check(L, *indexCount > 0, "Invalid mesh data: index count is zero");
+      luax_check(L, *indexCount % 3 == 0, "Index count must be a multiple of 3");
+      *indices = lovrMalloc(sizeof(uint32_t) * *indexCount);
+
+      for (uint32_t i = 0; i < *indexCount; i++) {
+        lua_rawgeti(L, index + 1, i + 1);
+        uint32_t index = luaL_checkinteger(L, -1) - 1;
+        luax_check(L, index < *vertexCount, "Invalid vertex index %d (expected [%d, %d])", index + 1, 1, *vertexCount);
+        (*indices)[i] = index;
+        lua_pop(L, 1);
+      }
     }
 
     return index + 2;
+  }
+
+  ModelData* modelData = luax_totype(L, index, ModelData);
+
+  if (modelData) {
+    lovrModelDataGetTriangles(modelData, vertices, indices, vertexCount, indexCount);
+    *shouldFree = false;
+    return index + 1;
   }
 
 #ifndef LOVR_DISABLE_GRAPHICS
@@ -569,11 +615,14 @@ int luax_readmesh(lua_State* L, int index, float** vertices, uint32_t* vertexCou
   Mesh* mesh = luax_totype(L, index, Mesh);
 
   if (mesh) {
-    lovrMeshGetTriangles(mesh, vertices, indices, vertexCount, indexCount);
+    luax_assert(L, lovrMeshGetTriangles(mesh, vertices, indices, vertexCount, indexCount));
     *shouldFree = true;
     return index + 1;
   }
-#endif
 
-  return luaL_argerror(L, index, "table, Mesh, or Model");
+  luaL_argerror(L, index, "table, ModelData, Model, or Mesh expected");
+#else
+  luaL_argerror(L, index, "table or ModelData expected");
+#endif
+  return 0;
 }

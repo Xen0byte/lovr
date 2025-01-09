@@ -1,10 +1,3 @@
-function lovr.conf(t)
-  t.headset.supersample = true
-  t.modules.audio = false
-  t.modules.physics = false
-  t.modules.thread = false
-end
-
 function lovr.load()
   if not lovr.graphics then
     print(string.format('LÖVR %d.%d.%d\nNo game', lovr.getVersion()))
@@ -16,7 +9,7 @@ function lovr.load()
     lovr.graphics.setBackgroundColor(0x20232c)
   end
 
-  logo = lovr.graphics.newShader('unlit', 'logo')
+  logo = lovr.graphics.newShader('unlit', 'logo.spv')
 end
 
 function lovr.draw(pass)

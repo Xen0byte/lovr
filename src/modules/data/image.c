@@ -48,6 +48,7 @@ static size_t measure(uint32_t w, uint32_t h, TextureFormat format) {
     case FORMAT_RGB10A2: return w * h * 4;
     case FORMAT_RG11B10F: return w * h * 4;
     case FORMAT_D16: return w * h * 2;
+    case FORMAT_D24: return w * h * 4;
     case FORMAT_D32F: return w * h * 4;
     case FORMAT_D24S8: return w * h * 4;
     case FORMAT_D32FS8: return w * h * 5;
@@ -79,14 +80,14 @@ static size_t measure(uint32_t w, uint32_t h, TextureFormat format) {
   }
 }
 
-Image* lovrImageCreateRaw(uint32_t width, uint32_t height, TextureFormat format) {
+Image* lovrImageCreateRaw(uint32_t width, uint32_t height, TextureFormat format, bool srgb) {
   lovrCheck(width > 0 && height > 0, "Image dimensions must be positive");
   lovrCheck(format < FORMAT_BC1, "Blank images cannot be compressed");
   size_t size = measure(width, height, format);
-  void* data = malloc(size);
-  Image* image = calloc(1, sizeof(Image));
-  lovrAssert(image && data, "Out of memory");
+  void* data = lovrMalloc(size);
+  Image* image = lovrCalloc(sizeof(Image));
   image->ref = 1;
+  image->flags = srgb ? IMAGE_SRGB : 0;
   image->width = width;
   image->height = height;
   image->format = format;
@@ -97,29 +98,27 @@ Image* lovrImageCreateRaw(uint32_t width, uint32_t height, TextureFormat format)
   return image;
 }
 
-static Image* loadDDS(Blob* blob);
-static Image* loadASTC(Blob* blob);
-static Image* loadKTX1(Blob* blob);
-static Image* loadKTX2(Blob* blob);
-static Image* loadSTB(Blob* blob);
+static bool loadDDS(Blob* blob, Image** image);
+static bool loadASTC(Blob* blob, Image** image);
+static bool loadKTX1(Blob* blob, Image** image);
+static bool loadKTX2(Blob* blob, Image** image);
+static bool loadSTB(Blob* blob, Image** image);
 
 Image* lovrImageCreateFromFile(Blob* blob) {
   Image* image = NULL;
-
-  if ((image = loadDDS(blob)) != NULL) return image;
-  if ((image = loadASTC(blob)) != NULL) return image;
-  if ((image = loadKTX1(blob)) != NULL) return image;
-  if ((image = loadKTX2(blob)) != NULL) return image;
-  if ((image = loadSTB(blob)) != NULL) return image;
-
-  lovrThrow("Could not load image from '%s': Image file format not recognized", blob->name);
-  return NULL;
+  if (!image && !loadDDS(blob, &image)) return NULL;
+  if (!image && !loadASTC(blob, &image)) return NULL;
+  if (!image && !loadKTX1(blob, &image)) return NULL;
+  if (!image && !loadKTX2(blob, &image)) return NULL;
+  if (!image && !loadSTB(blob, &image)) return NULL;
+  if (!image) lovrSetError("Could not load image from '%s': Image file format not recognized", blob->name);
+  return image;
 }
 
 void lovrImageDestroy(void* ref) {
   Image* image = ref;
   lovrRelease(image->blob, lovrBlobDestroy);
-  free(image);
+  lovrFree(image);
 }
 
 bool lovrImageIsSRGB(Image* image) {
@@ -137,6 +136,7 @@ bool lovrImageIsCube(Image* image) {
 bool lovrImageIsDepth(Image* image) {
   switch (image->format) {
     case FORMAT_D16:
+    case FORMAT_D24:
     case FORMAT_D32F:
     case FORMAT_D24S8:
     case FORMAT_D32FS8:
@@ -192,6 +192,9 @@ static void getPixelRGBA8(ImagePointer src, float* dst) { for (uint32_t i = 0; i
 static void getPixelR16(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 1; i++) dst[i] = src.u16[i] / 65535.f; }
 static void getPixelRG16(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 2; i++) dst[i] = src.u16[i] / 65535.f; }
 static void getPixelRGBA16(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 4; i++) dst[i] = src.u16[i] / 65535.f; }
+static void getPixelR16F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 1; i++) dst[i] = float16to32(src.u16[i]); }
+static void getPixelRG16F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 2; i++) dst[i] = float16to32(src.u16[i]); }
+static void getPixelRGBA16F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 4; i++) dst[i] = float16to32(src.u16[i]); }
 static void getPixelR32F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 1; i++) dst[i] = src.f32[i]; }
 static void getPixelRG32F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 2; i++) dst[i] = src.f32[i]; }
 static void getPixelRGBA32F(ImagePointer src, float* dst) { for (uint32_t i = 0; i < 4; i++) dst[i] = src.f32[i]; }
@@ -202,49 +205,58 @@ static void setPixelRGBA8(float* src, ImagePointer dst) { for (uint32_t i = 0; i
 static void setPixelR16(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 1; i++) dst.u16[i] = (uint16_t) (src[i] * 65535.f + .5f); }
 static void setPixelRG16(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 2; i++) dst.u16[i] = (uint16_t) (src[i] * 65535.f + .5f); }
 static void setPixelRGBA16(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 4; i++) dst.u16[i] = (uint16_t) (src[i] * 65535.f + .5f); }
+static void setPixelR16F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 1; i++) dst.u16[i] = float32to16(src[i]); }
+static void setPixelRG16F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 2; i++) dst.u16[i] = float32to16(src[i]); }
+static void setPixelRGBA16F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 4; i++) dst.u16[i] = float32to16(src[i]); }
 static void setPixelR32F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 1; i++) dst.f32[i] = src[i]; }
 static void setPixelRG32F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 2; i++) dst.f32[i] = src[i]; }
 static void setPixelRGBA32F(float* src, ImagePointer dst) { for (uint32_t i = 0; i < 4; i++) dst.f32[i] = src[i]; }
 
-void lovrImageGetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]) {
+bool lovrImageGetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]) {
   lovrCheck(!lovrImageIsCompressed(image), "Unable to access individual pixels of a compressed image");
-  lovrAssert(x < image->width && y < image->height, "Pixel coordinates must be within Image bounds");
+  lovrCheck(x < image->width && y < image->height, "Pixel coordinates must be within Image bounds");
   size_t offset = measure(y * image->width + x, 1, image->format);
   ImagePointer p = { .u8 = (uint8_t*) image->mipmaps[0].data + offset };
   switch (image->format) {
-    case FORMAT_R8: getPixelR8(p, pixel); return;
-    case FORMAT_RG8: getPixelRG8(p, pixel); return;
-    case FORMAT_RGBA8: getPixelRGBA8(p, pixel); return;
-    case FORMAT_R16: getPixelR16(p, pixel); return;
-    case FORMAT_RG16: getPixelRG16(p, pixel); return;
-    case FORMAT_RGBA16: getPixelRGBA16(p, pixel); return;
-    case FORMAT_R32F: getPixelR32F(p, pixel); return;
-    case FORMAT_RG32F: getPixelRG32F(p, pixel); return;
-    case FORMAT_RGBA32F: getPixelRGBA32F(p, pixel); return;
-    default: lovrThrow("Unsupported format for Image:getPixel");
+    case FORMAT_R8: getPixelR8(p, pixel); return true;
+    case FORMAT_RG8: getPixelRG8(p, pixel); return true;
+    case FORMAT_RGBA8: getPixelRGBA8(p, pixel); return true;
+    case FORMAT_R16: getPixelR16(p, pixel); return true;
+    case FORMAT_RG16: getPixelRG16(p, pixel); return true;
+    case FORMAT_RGBA16: getPixelRGBA16(p, pixel); return true;
+    case FORMAT_R16F: getPixelR16F(p, pixel); return true;
+    case FORMAT_RG16F: getPixelRG16F(p, pixel); return true;
+    case FORMAT_RGBA16F: getPixelRGBA16F(p, pixel); return true;
+    case FORMAT_R32F: getPixelR32F(p, pixel); return true;
+    case FORMAT_RG32F: getPixelRG32F(p, pixel); return true;
+    case FORMAT_RGBA32F: getPixelRGBA32F(p, pixel); return true;
+    default: return lovrSetError("Unsupported format for Image:getPixel");
   }
 }
 
-void lovrImageSetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]) {
+bool lovrImageSetPixel(Image* image, uint32_t x, uint32_t y, float pixel[4]) {
   lovrCheck(!lovrImageIsCompressed(image), "Unable to access individual pixels of a compressed image");
-  lovrAssert(x < image->width && y < image->height, "Pixel coordinates must be within Image bounds");
+  lovrCheck(x < image->width && y < image->height, "Pixel coordinates must be within Image bounds");
   size_t offset = measure(y * image->width + x, 1, image->format);
   ImagePointer p = { .u8 = (uint8_t*) image->mipmaps[0].data + offset };
   switch (image->format) {
-    case FORMAT_R8: setPixelR8(pixel, p); break;
-    case FORMAT_RG8: setPixelRG8(pixel, p); break;
-    case FORMAT_RGBA8: setPixelRGBA8(pixel, p); break;
-    case FORMAT_R16: setPixelR16(pixel, p); break;
-    case FORMAT_RG16: setPixelRG16(pixel, p); break;
-    case FORMAT_RGBA16: setPixelRGBA16(pixel, p); break;
-    case FORMAT_R32F: setPixelR32F(pixel, p); break;
-    case FORMAT_RG32F: setPixelRG32F(pixel, p); break;
-    case FORMAT_RGBA32F: setPixelRGBA32F(pixel, p); break;
-    default: lovrThrow("Unsupported format for Image:setPixel");
+    case FORMAT_R8: setPixelR8(pixel, p); return true;
+    case FORMAT_RG8: setPixelRG8(pixel, p); return true;
+    case FORMAT_RGBA8: setPixelRGBA8(pixel, p); return true;
+    case FORMAT_R16: setPixelR16(pixel, p); return true;
+    case FORMAT_RG16: setPixelRG16(pixel, p); return true;
+    case FORMAT_RGBA16: setPixelRGBA16(pixel, p); return true;
+    case FORMAT_R16F: setPixelR16F(pixel, p); return true;
+    case FORMAT_RG16F: setPixelRG16F(pixel, p); return true;
+    case FORMAT_RGBA16F: setPixelRGBA16F(pixel, p); return true;
+    case FORMAT_R32F: setPixelR32F(pixel, p); return true;
+    case FORMAT_RG32F: setPixelRG32F(pixel, p); return true;
+    case FORMAT_RGBA32F: setPixelRGBA32F(pixel, p); return true;
+    default: return lovrSetError("Unsupported format for Image:setPixel");
   }
 }
 
-void lovrImageMapPixel(Image* image, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, MapPixelCallback* callback, void* userdata) {
+bool lovrImageMapPixel(Image* image, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, MapPixelCallback* callback, void* userdata) {
   lovrCheck(!lovrImageIsCompressed(image), "Unable to access individual pixels of a compressed image");
   lovrCheck(x0 + w <= image->width, "Pixel rectangle must be within Image bounds");
   lovrCheck(y0 + h <= image->height, "Pixel rectangle must be within Image bounds");
@@ -257,9 +269,13 @@ void lovrImageMapPixel(Image* image, uint32_t x0, uint32_t y0, uint32_t w, uint3
     case FORMAT_R16: getPixel = getPixelR16, setPixel = setPixelR16; break;
     case FORMAT_RG16: getPixel = getPixelRG16, setPixel = setPixelRG16; break;
     case FORMAT_RGBA16: getPixel = getPixelRGBA16, setPixel = setPixelRGBA16; break;
+    case FORMAT_R16F: getPixel = getPixelR16F, setPixel = setPixelR16F; break;
+    case FORMAT_RG16F: getPixel = getPixelRG16F, setPixel = setPixelRG16F; break;
+    case FORMAT_RGBA16F: getPixel = getPixelRGBA16F, setPixel = setPixelRGBA16F; break;
     case FORMAT_R32F: getPixel = getPixelR32F, setPixel = setPixelR32F; break;
     case FORMAT_RG32F: getPixel = getPixelRG32F, setPixel = setPixelRG32F; break;
     case FORMAT_RGBA32F: getPixel = getPixelRGBA32F, setPixel = setPixelRGBA32F; break;
+    default: return lovrSetError("Unsupported format for Image:mapPixel");
   }
   float pixel[4] = { 0.f, 0.f, 0.f, 1.f };
   uint32_t width = image->width;
@@ -274,15 +290,16 @@ void lovrImageMapPixel(Image* image, uint32_t x0, uint32_t y0, uint32_t w, uint3
       p.u8 += stride;
     }
   }
+  return true;
 }
 
-void lovrImageCopy(Image* src, Image* dst, uint32_t srcOffset[2], uint32_t dstOffset[2], uint32_t extent[2]) {
-  lovrAssert(src->format == dst->format, "To copy between Images, their formats must match");
-  lovrAssert(!lovrImageIsCompressed(src), "Compressed Images cannot be copied");
-  lovrAssert(dstOffset[0] + extent[0] <= dst->width, "Image copy region extends past the destination image width");
-  lovrAssert(dstOffset[1] + extent[1] <= dst->height, "Image copy region extends past the destination image height");
-  lovrAssert(srcOffset[0] + extent[0] <= src->width, "Image copy region extends past the source image width");
-  lovrAssert(srcOffset[1] + extent[1] <= src->height, "Image copy region extends past the source image height");
+bool lovrImageCopy(Image* src, Image* dst, uint32_t srcOffset[2], uint32_t dstOffset[2], uint32_t extent[2]) {
+  lovrCheck(src->format == dst->format, "To copy between Images, their formats must match");
+  lovrCheck(!lovrImageIsCompressed(src), "Compressed Images cannot be copied");
+  lovrCheck(dstOffset[0] + extent[0] <= dst->width, "Image copy region extends past the destination image width");
+  lovrCheck(dstOffset[1] + extent[1] <= dst->height, "Image copy region extends past the destination image height");
+  lovrCheck(srcOffset[0] + extent[0] <= src->width, "Image copy region extends past the source image width");
+  lovrCheck(srcOffset[1] + extent[1] <= src->height, "Image copy region extends past the source image height");
   size_t pixelSize = measure(1, 1, src->format);
   uint8_t* p = (uint8_t*) lovrImageGetLayerData(src, 0, 0) + (srcOffset[1] * src->width + srcOffset[0]) * pixelSize;
   uint8_t* q = (uint8_t*) lovrImageGetLayerData(dst, 0, 0) + (dstOffset[1] * dst->width + dstOffset[0]) * pixelSize;
@@ -291,6 +308,7 @@ void lovrImageCopy(Image* src, Image* dst, uint32_t srcOffset[2], uint32_t dstOf
     p += src->width * pixelSize;
     q += dst->width * pixelSize;
   }
+  return true;
 }
 
 static uint32_t crc_lookup[256];
@@ -319,7 +337,7 @@ static uint32_t crc32(uint8_t* data, size_t length) {
 }
 
 Blob* lovrImageEncode(Image* image) {
-  lovrAssert(image->format == FORMAT_RGBA8, "Only images with the rgba8 format can be encoded");
+  lovrCheck(image->format == FORMAT_RGBA8, "Currently, only images with the rgba8 format can be encoded");
   uint32_t w = image->width;
   uint32_t h = image->height;
   uint8_t* pixels = (uint8_t*) image->blob->data;
@@ -349,8 +367,7 @@ Blob* lovrImageEncode(Image* image) {
   size += 4 + strlen("IHDR") + sizeof(header) + 4;
   size += 4 + strlen("IDAT") + idatSize + 4;
   size += 4 + strlen("IEND") + 4;
-  uint8_t* data = malloc(size);
-  lovrAssert(data, "Out of memory");
+  uint8_t* data = lovrMalloc(size);
 
   crc_init();
   uint32_t crc;
@@ -430,7 +447,7 @@ Blob* lovrImageEncode(Image* image) {
   return lovrBlobCreate(data - size, size, "Encoded Image");
 }
 
-static Image* loadDDS(Blob* blob) {
+static bool loadDDS(Blob* blob, Image** result) {
   enum { DDPF_FOURCC = 0x4, DDPF_RGB = 0x40 };
   enum { DDSD_DEPTH = 0x800000 };
   enum { DDS_RESOURCE_MISC_TEXTURECUBE = 0x4 };
@@ -578,21 +595,21 @@ static Image* loadDDS(Blob* blob) {
     uint32_t miscFlags2;
   } DDSHeader10;
 
-  if (blob->size < 4 + sizeof(DDSHeader)) return NULL;
+  if (blob->size < 4 + sizeof(DDSHeader)) return true;
 
   // Magic
   char* data = blob->data;
   size_t length = blob->size;
   uint32_t magic;
   memcpy(&magic, data, 4);
-  if (magic != 0x20534444) return false;
+  if (magic != 0x20534444) return true;
   length -= 4;
   data += 4;
 
   // Header
   DDSHeader* header = (DDSHeader*) data;
-  if (length < sizeof(DDSHeader)) return NULL;
-  if (header->size != sizeof(DDSHeader) || header->format.size != sizeof(header->format)) return NULL;
+  if (length < sizeof(DDSHeader)) return true;
+  if (header->size != sizeof(DDSHeader) || header->format.size != sizeof(header->format)) return true;
   length -= sizeof(DDSHeader);
   data += sizeof(DDSHeader);
 
@@ -602,7 +619,7 @@ static Image* loadDDS(Blob* blob) {
 
   // Header10
   if ((header->format.flags & DDPF_FOURCC) && !memcmp(&header->format.fourCC, "DX10", 4)) {
-    if (length < sizeof(DDSHeader10)) return NULL;
+    if (length < sizeof(DDSHeader10)) return true;
     DDSHeader10* header10 = (DDSHeader10*) data;
     length -= sizeof(DDSHeader10);
     data += sizeof(DDSHeader10);
@@ -751,7 +768,9 @@ static Image* loadDDS(Blob* blob) {
         format = FORMAT_BC7;
         break;
 
-      default: lovrThrow("DDS file uses an unsupported DXGI format (%d)", header10->dxgiFormat);
+      default:
+        lovrSetError("DDS file uses an unsupported DXGI format (%d)", header10->dxgiFormat);
+        return false;
     }
 
     lovrAssert(header10->resourceDimension != D3D10_RESOURCE_DIMENSION_TEXTURE3D, "Loading 3D DDS images is not supported");
@@ -781,16 +800,15 @@ static Image* loadDDS(Blob* blob) {
     else if (header->format.fourCC == 0x72) format = FORMAT_R32F;
     else if (header->format.fourCC == 0x73) format = FORMAT_RG32F;
     else if (header->format.fourCC == 0x74) format = FORMAT_RGBA32F;
-    else lovrThrow("DDS file uses an unsupported FourCC format (%d)", header->format.fourCC);
+    else return lovrSetError("DDS file uses an unsupported FourCC format (%d)", header->format.fourCC);
   } else {
-    lovrThrow("DDS file uses an unsupported format"); // TODO could handle more uncompressed formats
+    return lovrSetError("DDS file uses an unsupported format"); // TODO could handle more uncompressed formats
   }
 
   lovrAssert(~header->flags & DDSD_DEPTH, "Loading 3D DDS images is not supported");
   uint32_t levels = MAX(1, header->mipmapCount);
 
-  Image* image = calloc(1, offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
-  lovrAssert(image, "Out of memory");
+  Image* image = lovrCalloc(offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
   image->ref = 1;
   image->flags = flags;
   image->width = header->width;
@@ -799,12 +817,16 @@ static Image* loadDDS(Blob* blob) {
   image->layers = layers;
   image->levels = levels;
   image->blob = blob;
-  lovrRetain(blob);
 
   size_t stride = 0;
   for (uint32_t i = 0, width = image->width, height = image->height; i < levels; i++) {
     size_t size = measure(width, height, format);
-    lovrAssert(length >= size, "DDS file overflow");
+
+    if (length < size) {
+      lovrFree(image);
+      return lovrSetError("DDS file overflow");
+    }
+
     image->mipmaps[i] = (Mipmap) { data, size, 0 };
     width = MAX(width >> 1, 1);
     height = MAX(height >> 1, 1);
@@ -817,10 +839,12 @@ static Image* loadDDS(Blob* blob) {
     image->mipmaps[i].stride = stride;
   }
 
-  return image;
+  lovrRetain(blob);
+  *result = image;
+  return true;
 }
 
-static Image* loadASTC(Blob* blob) {
+static bool loadASTC(Blob* blob, Image** result) {
   struct {
     uint32_t magic;
     uint8_t blockX;
@@ -832,13 +856,13 @@ static Image* loadASTC(Blob* blob) {
   } header;
 
   if (blob->size <= sizeof(header)) {
-    return NULL;
+    return true;
   }
 
   memcpy(&header, blob->data, sizeof(header));
 
   if (header.magic != 0x5ca1ab13) {
-    return NULL;
+    return true;
   }
 
   TextureFormat format;
@@ -858,7 +882,7 @@ static Image* loadASTC(Blob* blob) {
   else if (bx == 10 && by == 10 && bz == 1) { format = FORMAT_ASTC_10x10; }
   else if (bx == 12 && by == 10 && bz == 1) { format = FORMAT_ASTC_12x10; }
   else if (bx == 12 && by == 12 && bz == 1) { format = FORMAT_ASTC_12x12; }
-  else { lovrThrow("Unsupported ASTC format %dx%dx%d", bx, by, bz); }
+  else { return lovrSetError("Unsupported ASTC format %dx%dx%d", bx, by, bz); }
 
   uint32_t width = header.width[0] + (header.width[1] << 8) + (header.width[2] << 16);
   uint32_t height = header.height[0] + (header.height[1] << 8) + (header.height[2] << 16);
@@ -866,11 +890,10 @@ static Image* loadASTC(Blob* blob) {
   size_t imageSize = ((width + bx - 1) / bx) * ((height + by - 1) / by) * (128 / 8);
 
   if (imageSize > blob->size - sizeof(header)) {
-    return NULL;
+    return lovrSetError("ASTC size overflows file size");
   }
 
-  Image* image = calloc(1, sizeof(Image));
-  lovrAssert(image, "Out of memory");
+  Image* image = lovrCalloc(sizeof(Image));
   image->ref = 1;
   image->width = width;
   image->height = height;
@@ -881,10 +904,11 @@ static Image* loadASTC(Blob* blob) {
   image->blob = blob;
   lovrRetain(blob);
   image->mipmaps[0] = (Mipmap) { (char*) blob->data + sizeof(header), imageSize, 0 };
-  return image;
+  *result = image;
+  return true;
 }
 
-static Image* loadKTX1(Blob* blob) {
+static bool loadKTX1(Blob* blob, Image** result) {
   struct {
     uint8_t magic[12];
     uint32_t endianness;
@@ -903,7 +927,7 @@ static Image* loadKTX1(Blob* blob) {
   } header;
 
   if (blob->size <= sizeof(header)) {
-    return NULL;
+    return true;
   }
 
   memcpy(&header, blob->data, sizeof(header));
@@ -911,7 +935,7 @@ static Image* loadKTX1(Blob* blob) {
   uint8_t magic[] = { 0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
 
   if (memcmp(header.magic, magic, sizeof(magic)) || header.endianness != 0x04030201) {
-    return NULL;
+    return true;
   }
 
   char* data = blob->data;
@@ -920,32 +944,30 @@ static Image* loadKTX1(Blob* blob) {
   length -= sizeof(header);
 
   if (length < header.bytesOfKeyValueData) {
-    return NULL;
+    return lovrSetError("Invalid KTX file");
   }
 
   data += header.bytesOfKeyValueData;
   length -= header.bytesOfKeyValueData;
 
-  lovrAssert(header.pixelWidth > 0, "KTX image dimensions must be positive");
-  lovrAssert(header.pixelHeight > 0, "Unable to load 1D KTX images");
-  lovrAssert(header.pixelDepth == 0, "Unable to load 3D KTX images");
+  lovrCheck(header.pixelWidth > 0, "KTX image dimensions must be positive");
+  lovrCheck(header.pixelHeight > 0, "Unable to load 1D KTX images");
+  lovrCheck(header.pixelDepth == 0, "Unable to load 3D KTX images");
+  lovrCheck(header.numberOfFaces == 1 || header.numberOfFaces == 6, "KTX files must have 1 or 6 faces");
+  lovrCheck(header.numberOfFaces == 1 || header.numberOfArrayElements == 0, "KTX files with cubemap arrays are not currently supported");
 
   uint32_t layers = MAX(header.numberOfArrayElements, 1);
   uint32_t levels = MAX(header.numberOfMipmapLevels, 1);
 
-  Image* image = calloc(1, offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
-  lovrAssert(image, "Out of memory");
+  Image* image = lovrCalloc(offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
   image->ref = 1;
   image->width = header.pixelWidth;
   image->height = header.pixelHeight;
   image->layers = layers;
   image->levels = levels;
   image->blob = blob;
-  lovrRetain(blob);
 
-  if (header.numberOfFaces > 1) {
-    lovrAssert(header.numberOfFaces == 6, "KTX files must have 1 or 6 faces");
-    lovrAssert(header.numberOfArrayElements == 0, "KTX files with cubemap arrays are not supported");
+  if (header.numberOfFaces == 6) {
     image->flags |= IMAGE_CUBEMAP;
     image->layers = 6;
   }
@@ -970,6 +992,7 @@ static Image* loadKTX1(Blob* blob) {
     [FORMAT_RGB10A2]    = { 0x8368, 0x1908, 0x8059, 0 },
     [FORMAT_RG11B10F]   = { 0x8C3A, 0x1907, 0x8C3A, 0 },
     [FORMAT_D16]        = { 0x1403, 0x1902, 0x81A5, 0 },
+    [FORMAT_D24]        = { 0x1405, 0x1902, 0x81A6, 0 },
     [FORMAT_D32F]       = { 0x1406, 0x1902, 0x8CAC, 0 },
     [FORMAT_D24S8]      = { 0x84FA, 0x84F9, 0x88F0, 0 },
     [FORMAT_D32FS8]     = { 0x8DAD, 0x84F9, 0x8CAD, 0 },
@@ -1012,7 +1035,11 @@ static Image* loadKTX1(Blob* blob) {
       }
     }
   }
-  lovrAssert(image->format != ~0u, "KTX1 file uses an unsupported image format (glType = %d, glFormat = %d, glInternalFormat = %d)", header.glType, header.glFormat, header.glInternalFormat);
+
+  if (image->format == ~0u) {
+    lovrFree(image);
+    return lovrSetError("KTX1 file uses an unsupported image format (glType = 0x%x, glFormat = 0x%x, glInternalFormat = 0x%x)", header.glType, header.glFormat, header.glInternalFormat);
+  }
 
   // Mipmaps
   uint32_t width = image->width;
@@ -1022,12 +1049,20 @@ static Image* loadKTX1(Blob* blob) {
     uint32_t levelSize;
     memcpy(&levelSize, data, 4);
     size_t size = measure(width, height, image->format);
-    lovrAssert(levelSize / divisor == size, "KTX size mismatch");
+    if (levelSize / divisor != size) {
+      lovrFree(image);
+      return lovrSetError("KTX size mismatch");
+    }
+
     length -= 4;
     data += 4;
 
     size_t totalSize = size * image->layers;
-    lovrAssert(length >= totalSize, "KTX file overflow");
+    if (length < totalSize) {
+      lovrFree(image);
+      return lovrSetError("KTX file overflow");
+    }
+
     image->mipmaps[i] = (Mipmap) { data, size, size };
     width = MAX(width >> 1, 1);
     height = MAX(height >> 1, 1);
@@ -1035,10 +1070,12 @@ static Image* loadKTX1(Blob* blob) {
     data += totalSize;
   }
 
-  return image;
+  lovrRetain(blob);
+  *result = image;
+  return true;
 }
 
-static Image* loadKTX2(Blob* blob) {
+static bool loadKTX2(Blob* blob, Image** result) {
   typedef struct {
     uint8_t magic[12];
     uint32_t vkFormat;
@@ -1070,28 +1107,26 @@ static Image* loadKTX2(Blob* blob) {
   uint8_t magic[] = { 0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
 
   if (length < sizeof(KTX2Header) || memcmp(header->magic, magic, sizeof(magic))) {
-    return NULL;
+    return true;
   }
 
-  lovrAssert(header->pixelWidth > 0, "KTX image dimensions must be positive");
-  lovrAssert(header->pixelHeight > 0, "Unable to load 1D KTX images");
-  lovrAssert(header->pixelDepth == 0, "Unable to load 3D KTX images");
-  lovrAssert(header->faceCount == 1 || header->faceCount == 6, "Invalid KTX file (faceCount must be 1 or 6)");
-  lovrAssert(header->layerCount == 0 || header->faceCount == 1, "Unable to load cubemap array KTX images");
-  lovrAssert(!header->compression, "Supercompressed KTX files are not currently supported");
+  lovrCheck(header->pixelWidth > 0, "KTX image dimensions must be positive");
+  lovrCheck(header->pixelHeight > 0, "Unable to load 1D KTX images");
+  lovrCheck(header->pixelDepth == 0, "Unable to load 3D KTX images");
+  lovrCheck(header->faceCount == 1 || header->faceCount == 6, "Invalid KTX file (faceCount must be 1 or 6)");
+  lovrCheck(header->layerCount == 0 || header->faceCount == 1, "Unable to load cubemap array KTX images");
+  lovrCheck(!header->compression, "Supercompressed KTX files are not currently supported");
 
   uint32_t layers = MAX(header->layerCount, 1);
   uint32_t levels = MAX(header->levelCount, 1);
 
-  Image* image = calloc(1, offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
-  lovrAssert(image, "Out of memory");
+  Image* image = lovrCalloc(offsetof(Image, mipmaps) + levels * sizeof(Mipmap));
   image->ref = 1;
   image->width = header->pixelWidth;
   image->height = header->pixelHeight;
   image->layers = layers;
   image->levels = levels;
   image->blob = blob;
-  lovrRetain(blob);
 
   if (header->faceCount == 6) {
     image->flags |= IMAGE_CUBEMAP;
@@ -1117,6 +1152,7 @@ static Image* loadKTX2(Blob* blob) {
     case 64:  image->format = FORMAT_RGB10A2; break;
     case 122: image->format = FORMAT_RG11B10F; break;
     case 124: image->format = FORMAT_D16; break;
+    case 125: image->format = FORMAT_D24; break;
     case 126: image->format = FORMAT_D32F; break;
     case 129: image->format = FORMAT_D24S8; break;
     case 130: image->format = FORMAT_D32FS8; break;
@@ -1144,7 +1180,9 @@ static Image* loadKTX2(Blob* blob) {
     case 180: image->flags |= IMAGE_SRGB; /* fallthrough */ case 179: image->format = FORMAT_ASTC_10x10; break;
     case 182: image->flags |= IMAGE_SRGB; /* fallthrough */ case 181: image->format = FORMAT_ASTC_12x10; break;
     case 184: image->flags |= IMAGE_SRGB; /* fallthrough */ case 183: image->format = FORMAT_ASTC_12x12; break;
-    default: lovrThrow("KTX file uses an unsupported image format");
+    default:
+      lovrFree(image);
+      return lovrSetError("KTX file uses an unsupported image format");
   }
 
   // Mipmaps
@@ -1154,17 +1192,28 @@ static Image* loadKTX2(Blob* blob) {
     uint64_t offset = header->levels[i].byteOffset;
     uint64_t size = header->levels[i].byteLength;
     size_t stride = size / image->layers;
-    lovrAssert(offset + size <= blob->size, "KTX file overflow");
-    lovrAssert(measure(width, height, image->format) == size, "KTX size mismatch");
+
+    if (offset + size > blob->size) {
+      lovrFree(image);
+      return lovrSetError("KTX file overflow");
+    }
+
+    if (measure(width, height, image->format) != size) {
+      lovrFree(image);
+      return lovrSetError("KTX size mismatch");
+    }
+
     image->mipmaps[i] = (Mipmap) { data + offset, stride, stride };
     width = MAX(width >> 1, 1);
     height = MAX(height >> 1, 1);
   }
 
-  return image;
+  lovrRetain(blob);
+  *result = image;
+  return true;
 }
 
-static Image* loadSTB(Blob* blob) {
+static bool loadSTB(Blob* blob, Image** result) {
   void* data;
   uint32_t flags = 0;
   TextureFormat format;
@@ -1175,7 +1224,7 @@ static Image* loadSTB(Blob* blob) {
       case 1: format = FORMAT_R16; break;
       case 2: format = FORMAT_RG16; break;
       case 4: format = FORMAT_RGBA16; break;
-      default: lovrThrow("Unsupported channel count for 16 bit image: %d", channels);
+      default: return lovrSetError("Unsupported channel count for 16 bit image: %d", channels);
     }
     flags = IMAGE_SRGB;
   } else if (stbi_is_hdr_from_memory(blob->data, (int) blob->size)) {
@@ -1188,13 +1237,12 @@ static Image* loadSTB(Blob* blob) {
   }
 
   if (!data) {
-    return NULL;
+    return true;
   }
 
   size_t size = measure(width, height, format);
 
-  Image* image = calloc(1, sizeof(Image));
-  lovrAssert(image, "Out of memory");
+  Image* image = lovrCalloc(sizeof(Image));
   image->ref = 1;
   image->flags = flags;
   image->width = width;
@@ -1204,5 +1252,6 @@ static Image* loadSTB(Blob* blob) {
   image->levels = 1;
   image->blob = lovrBlobCreate(data, size, blob->name);
   image->mipmaps[0] = (Mipmap) { data, size, 0 };
-  return image;
+  *result = image;
+  return true;
 }

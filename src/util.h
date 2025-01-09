@@ -6,14 +6,8 @@
 
 #define LOVR_VERSION_MAJOR 0
 #define LOVR_VERSION_MINOR 17
-#define LOVR_VERSION_PATCH 0
+#define LOVR_VERSION_PATCH 1
 #define LOVR_VERSION_ALIAS "Tritium Gourmet"
-
-#ifdef _MSC_VER
-#define LOVR_THREAD_LOCAL __declspec(thread)
-#else
-#define LOVR_THREAD_LOCAL __thread
-#endif
 
 #ifdef __cplusplus
 #define LOVR_NORETURN [[noreturn]]
@@ -33,24 +27,72 @@
 #define CHECK_SIZEOF(T) int(*_o)[sizeof(T)]=1
 #define BREAK() __asm("int $3")
 
-// Error handling
-typedef void errorFn(void*, const char*, va_list);
-void lovrSetErrorCallback(errorFn* callback, void* userdata);
-LOVR_NORETURN void lovrThrow(const char* format, ...);
-#define lovrAssert(c, ...) if (!(c)) { lovrThrow(__VA_ARGS__); }
-#define lovrUnreachable() lovrThrow("Unreachable")
+// Allocation
+void* lovrMalloc(size_t size);
+void* lovrCalloc(size_t size);
+void* lovrRealloc(void* data, size_t size);
+void lovrFree(void* data);
 
+// Refcounting (to be refcounted, a struct must have a uint32_t refcount as its first field)
+void lovrRetain(void* ref);
+void lovrRelease(void* ref, void (*destructor)(void*));
+
+// Errors
+
+const char* lovrGetError(void);
+int lovrSetError(const char* format, ...);
+
+#define lovrUnreachable() abort()
+#define lovrAssert(c, ...) do { if (!(c)) { lovrSetError(__VA_ARGS__); return 0; } } while (0)
+#define lovrAssertGoto(label, c, ...) do { if (!(c)) { lovrSetError(__VA_ARGS__); goto label; } } while (0)
 #ifdef LOVR_UNCHECKED
 #define lovrCheck(c, ...) ((void) 0)
+#define lovrCheckGoto(c, label, ...) ((void) 0)
 #else
 #define lovrCheck lovrAssert
+#define lovrCheckGoto lovrAssertGoto
 #endif
 
 // Logging
-typedef void logFn(void*, int, const char*, const char*, va_list);
+typedef void fn_log(void*, int, const char*, const char*, va_list);
 enum { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
-void lovrSetLogCallback(logFn* callback, void* userdata);
+void lovrSetLogCallback(fn_log* callback, void* userdata);
 void lovrLog(int level, const char* tag, const char* format, ...);
+
+// Profiling
+#ifdef LOVR_PROFILE
+#include <TracyC.h>
+#define lovrProfileMarkFrame() TracyCFrameMark
+#define lovrProfileStart(id, label) TracyCZoneN(id, label, true)
+#define lovrProfileEnd(id) TracyCZoneEnd(id)
+#define lovrProfileAlloc(p, size) TracyCAlloc(p, size)
+#define lovrProfileFree(p) TracyCFree(p)
+#else
+#define lovrProfileMarkFrame() ((void) 0)
+#define lovrProfileStart(id, label) ((void) 0)
+#define lovrProfileEnd(id) ((void) 0)
+#define lovrProfileAlloc(p, size) ((void) 0)
+#define lovrProfileFree(p) ((void) 0)
+#endif
+
+// Dynamic Array
+#define arr_t(T) struct { T* data; size_t length, capacity; }
+#define arr_init(a) (a)->data = NULL, (a)->length = 0, (a)->capacity = 0
+#define arr_free(a) if ((a)->data) lovrFree((a)->data)
+#define arr_reserve(a, n) _arr_reserve((void**) &((a)->data), n, &(a)->capacity, sizeof(*(a)->data))
+#define arr_expand(a, n) arr_reserve(a, (a)->length + n)
+#define arr_push(a, x) arr_reserve(a, (a)->length + 1), (a)->data[(a)->length] = x, (a)->length++
+#define arr_pop(a) (a)->data[--(a)->length]
+#define arr_append(a, p, n) arr_reserve(a, (a)->length + n), memcpy((a)->data + (a)->length, p, n * sizeof(*(p))), (a)->length += n
+#define arr_splice(a, i, n) memmove((a)->data + (i), (a)->data + ((i) + n), ((a)->length - (i) - (n)) * sizeof(*(a)->data)), (a)->length -= n
+#define arr_clear(a) (a)->length = 0
+
+static inline void _arr_reserve(void** data, size_t n, size_t* capacity, size_t stride) {
+  if (*capacity >= n) return;
+  if (*capacity == 0) *capacity = 1;
+  while (*capacity < n) *capacity *= 2;
+  *data = lovrRealloc(*data, *capacity * stride);
+}
 
 // Hash function (FNV1a)
 static inline uint64_t hash64(const void* data, size_t length) {
@@ -62,34 +104,7 @@ static inline uint64_t hash64(const void* data, size_t length) {
   return hash;
 }
 
-// Refcounting
-void lovrRetain(void* ref);
-void lovrRelease(void* ref, void (*destructor)(void*));
-
-// Dynamic Array
-typedef void* arr_allocator(void* data, size_t size);
-#define arr_t(T) struct { T* data; arr_allocator* alloc; size_t length, capacity; }
-#define arr_init(a, allocator) (a)->data = NULL, (a)->length = 0, (a)->capacity = 0, (a)->alloc = allocator
-#define arr_free(a) if ((a)->data) (a)->alloc((a)->data, 0)
-#define arr_reserve(a, n) _arr_reserve((void**) &((a)->data), n, &(a)->capacity, sizeof(*(a)->data), (a)->alloc)
-#define arr_expand(a, n) arr_reserve(a, (a)->length + n)
-#define arr_push(a, x) arr_reserve(a, (a)->length + 1), (a)->data[(a)->length] = x, (a)->length++
-#define arr_pop(a) (a)->data[--(a)->length]
-#define arr_append(a, p, n) arr_reserve(a, (a)->length + n), memcpy((a)->data + (a)->length, p, n * sizeof(*(p))), (a)->length += n
-#define arr_splice(a, i, n) memmove((a)->data + (i), (a)->data + ((i) + n), ((a)->length - (i) - (n)) * sizeof(*(a)->data)), (a)->length -= n
-#define arr_clear(a) (a)->length = 0
-
-void* arr_alloc(void* data, size_t size);
-
-static inline void _arr_reserve(void** data, size_t n, size_t* capacity, size_t stride, arr_allocator* allocator) {
-  if (*capacity >= n) return;
-  if (*capacity == 0) *capacity = 1;
-  while (*capacity < n) *capacity *= 2;
-  *data = allocator(*data, *capacity * stride);
-  lovrAssert(*data, "Out of memory");
-}
-
-// Hashmap
+// Hashmap (does not support removal)
 typedef struct {
   uint64_t* hashes;
   uint64_t* values;
@@ -103,7 +118,6 @@ void map_init(map_t* map, uint32_t n);
 void map_free(map_t* map);
 uint64_t map_get(map_t* map, uint64_t hash);
 void map_set(map_t* map, uint64_t hash, uint64_t value);
-void map_remove(map_t* map, uint64_t hash);
 
 // UTF-8
 size_t utf8_decode(const char *s, const char *e, unsigned *pch);

@@ -1,14 +1,15 @@
 #include "math.h"
 #include "core/maf.h"
+#include "core/os.h"
 #include "util.h"
 #include "lib/noise/simplexnoise1234.h"
 #include <math.h>
-#include <string.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
-#include <math.h>
 
 struct Curve {
   uint32_t ref;
@@ -31,20 +32,20 @@ struct RandomGenerator {
 };
 
 static struct {
-  bool initialized;
+  uint32_t ref;
   RandomGenerator* generator;
 } state;
 
 bool lovrMathInit(void) {
-  if (state.initialized) return false;
+  if (atomic_fetch_add(&state.ref, 1)) return false;
   state.generator = lovrRandomGeneratorCreate();
   Seed seed = { .b64 = (uint64_t) time(0) };
   lovrRandomGeneratorSetSeed(state.generator, seed);
-  return state.initialized = true;
+  return true;
 }
 
 void lovrMathDestroy(void) {
-  if (!state.initialized) return;
+  if (atomic_fetch_sub(&state.ref, 1) != 1) return;
   lovrRelease(state.generator, lovrRandomGeneratorDestroy);
   memset(&state, 0, sizeof(state));
 }
@@ -128,10 +129,9 @@ static void evaluate(float* restrict P, size_t n, float t, vec4 p) {
 }
 
 Curve* lovrCurveCreate(void) {
-  Curve* curve = calloc(1, sizeof(Curve));
-  lovrAssert(curve, "Out of memory");
+  Curve* curve = lovrCalloc(sizeof(Curve));
   curve->ref = 1;
-  arr_init(&curve->points, arr_alloc);
+  arr_init(&curve->points);
   arr_reserve(&curve->points, 16);
   return curve;
 }
@@ -139,13 +139,14 @@ Curve* lovrCurveCreate(void) {
 void lovrCurveDestroy(void* ref) {
   Curve* curve = ref;
   arr_free(&curve->points);
-  free(curve);
+  lovrFree(curve);
 }
 
-void lovrCurveEvaluate(Curve* curve, float t, vec4 p) {
-  lovrAssert(curve->points.length >= 8, "Need at least 2 points to evaluate a Curve");
-  lovrAssert(t >= 0.f && t <= 1.f, "Curve evaluation interval must be within [0, 1]");
+bool lovrCurveEvaluate(Curve* curve, float t, vec4 p) {
+  lovrCheck(curve->points.length >= 8, "Need at least 2 points to evaluate a Curve");
+  lovrCheck(t >= 0.f && t <= 1.f, "Curve evaluation interval must be within [0, 1]");
   evaluate(curve->points.data, curve->points.length / 4, t, p);
+  return true;
 }
 
 void lovrCurveGetTangent(Curve* curve, float t, vec4 p) {
@@ -158,8 +159,8 @@ void lovrCurveGetTangent(Curve* curve, float t, vec4 p) {
 }
 
 Curve* lovrCurveSlice(Curve* curve, float t1, float t2) {
-  lovrAssert(curve->points.length >= 8, "Need at least 2 points to slice a Curve");
-  lovrAssert(t1 >= 0.f && t2 <= 1.f, "Curve slice interval must be within [0, 1]");
+  lovrCheck(curve->points.length >= 8, "Need at least 2 points to slice a Curve");
+  lovrCheck(t1 >= 0.f && t2 <= 1.f, "Curve slice interval must be within [0, 1]");
 
   Curve* new = lovrCurveCreate();
   arr_reserve(&new->points, curve->points.length);
@@ -177,7 +178,9 @@ Curve* lovrCurveSlice(Curve* curve, float t1, float t2) {
   // Split segment at t2, taking left half
   float t = (t2 - t1) / (1.f - t1);
   for (size_t i = n - 1; i >= 1; i--) {
-    evaluate(new->points.data, i + 1, t, new->points.data + 4 * i);
+    float point[4];
+    evaluate(new->points.data, i + 1, t, point);
+    vec4_init(new->points.data + 4 * i, point);
   }
 
   return new;
@@ -226,33 +229,39 @@ static const size_t vectorComponents[] = {
 };
 
 Pool* lovrPoolCreate(void) {
-  Pool* pool = calloc(1, sizeof(Pool));
-  lovrAssert(pool, "Out of memory");
+  Pool* pool = lovrCalloc(sizeof(Pool));
   pool->ref = 1;
+  pool->data = os_vm_init((1 << 24) * sizeof(float));
   lovrPoolGrow(pool, 1 << 12);
   return pool;
 }
 
 void lovrPoolDestroy(void* ref) {
   Pool* pool = ref;
-  free(pool->data);
-  free(pool);
+  os_vm_free(pool->data, (1 << 24) * sizeof(float));
+  lovrFree(pool);
 }
 
-void lovrPoolGrow(Pool* pool, size_t count) {
+bool lovrPoolGrow(Pool* pool, size_t count) {
   lovrAssert(count <= (1 << 24), "Temporary vector space exhausted.  Try using lovr.math.drain to drain the vector pool periodically.");
   pool->count = (uint32_t) count; // Assert guarantees safe
-  pool->data = realloc(pool->data, pool->count * sizeof(float));
-  lovrAssert(pool->data, "Out of memory");
+  bool result = os_vm_commit(pool->data, count * sizeof(float));
+  lovrAssert(result, "Out of memory");
+  return true;
 }
 
 Vector lovrPoolAllocate(Pool* pool, VectorType type, float** data) {
-  lovrCheck(pool, "The math module must be initialized to create vectors");
+  if (!pool) {
+    lovrSetError("The math module must be initialized to create vectors");
+    return (Vector) { 0 };
+  }
 
   size_t count = vectorComponents[type];
 
   if (pool->cursor + count > pool->count) {
-    lovrPoolGrow(pool, pool->count * 2);
+    if (!lovrPoolGrow(pool, pool->count * 2)) {
+      return (Vector) { 0 };
+    }
   }
 
   Vector v = {
@@ -269,7 +278,7 @@ Vector lovrPoolAllocate(Pool* pool, VectorType type, float** data) {
 }
 
 float* lovrPoolResolve(Pool* pool, Vector vector) {
-  lovrAssert(vector.handle.generation == pool->generation, "Attempt to use a temporary vector from a previous frame");
+  lovrCheck(vector.handle.generation == pool->generation, "Attempt to use a temporary vector from a previous frame");
   return pool->data + vector.handle.index;
 }
 
@@ -298,8 +307,7 @@ static uint64_t wangHash64(uint64_t key) {
 // Use an 'Xorshift*' variant, as shown here: http://xorshift.di.unimi.it
 
 RandomGenerator* lovrRandomGeneratorCreate(void) {
-  RandomGenerator* generator = calloc(1, sizeof(RandomGenerator));
-  lovrAssert(generator, "Out of memory");
+  RandomGenerator* generator = lovrCalloc(sizeof(RandomGenerator));
   generator->ref = 1;
   Seed seed = { .b32 = { .lo = 0xCBBF7A44, .hi = 0x0139408D } };
   lovrRandomGeneratorSetSeed(generator, seed);
@@ -308,7 +316,7 @@ RandomGenerator* lovrRandomGeneratorCreate(void) {
 }
 
 void lovrRandomGeneratorDestroy(void* ref) {
-  free(ref);
+  lovrFree(ref);
 }
 
 Seed lovrRandomGeneratorGetSeed(RandomGenerator* generator) {

@@ -96,7 +96,7 @@ flags = {
 
 cflags = {
   '-std=c11 -pedantic',
-  '-Wall -Wextra -Wno-unused-parameter',
+  '-Wall -Wextra -Wno-unused-parameter -Wno-strict-prototypes',
   config.strict and '-Werror' or '',
   config.optimize and '-fdata-sections -ffunction-sections' or '',
   '-fdiagnostics-color=always',
@@ -142,7 +142,11 @@ if target == 'linux' then
   cflags += '-D_DEFAULT_SOURCE'
   lflags += '-lm -lpthread -ldl'
   lflags += '-Wl,-rpath,\\$ORIGIN'
-  lflags += '-lX11 -lxcb -lX11-xcb'
+  if config.glfw then
+    lflags += '-lX11 -lxcb -lX11-xcb'
+  else
+    lflags += '-lxcb -lxcb-xinput -lxcb-xkb -lxkbcommon -lxkbcommon-x11'
+  end
 end
 
 if target == 'wasm' then
@@ -207,7 +211,7 @@ if config.luajit then
   end
   cflags += '-Ideps/luajit/src'
   lflags += '-L' .. config.luajit
-  lflags += '-lluajit'
+  lflags += '-lluajit-5.1'
 else
   cflags += '-Ideps/lua'
   lflags += '-llua'
@@ -234,10 +238,10 @@ if config.glfw and (target == 'win32' or target == 'macos' or target == 'linux')
 
   glfw_cflags += '-fPIC'
   glfw_cflags += ({ win32 = '-D_GLFW_WIN32', macos = '-D_GLFW_COCOA', linux = '-D_GLFW_X11' })[target]
-  glfw_src += { 'init.c', 'context.c', 'input.c', 'monitor.c', 'vulkan.c', 'window.c' }
+  glfw_src += { 'init.c', 'context.c', 'platform.c', 'null*.c', 'input.c', 'monitor.c', 'vulkan.c', 'window.c' }
   glfw_src += ({
     win32 = { 'win32*.c', 'wgl*.c', 'egl*.c', 'osmesa*.c' },
-    macos = { 'cocoa*.c', 'cocoa*.m', 'posix_thread.c', 'egl*.c', 'nsgl*.m', 'osmesa*.c' },
+    macos = { 'cocoa*.c', 'cocoa*.m', 'posix_module.c', 'posix_thread.c', 'egl*.c', 'nsgl*.m', 'osmesa*.c' },
     linux = { 'x11*.c', 'xkb*.c', 'posix*.c', 'glx*.c', 'egl*.c', 'linux*.c', 'osmesa*.c' }
   })[target]
   for i = 1, #glfw_src do glfw_src[i] = 'deps/glfw/src/' .. glfw_src[i] end
@@ -259,8 +263,8 @@ if config.modules.graphics and config.glslang then
   glslang_cflags += '-fno-exceptions'
   glslang_cflags += '-fno-rtti'
   glslang_cflags += '-Ideps/glslang'
+  glslang_cflags += '-I.obj'
   glslang_lflags += '-shared'
-  glslang_src += 'deps/glslang/OGLCompilersDLL/*.cpp'
   glslang_src += 'deps/glslang/glslang/CInterface/*.cpp'
   glslang_src += 'deps/glslang/glslang/MachineIndependent/*.cpp'
   glslang_src += 'deps/glslang/glslang/MachineIndependent/preprocessor/*.cpp'
@@ -275,7 +279,9 @@ if config.modules.graphics and config.glslang then
   glslang_src += 'deps/glslang/SPIRV/CInterface/spirv_c_interface.cpp'
   glslang_src += 'deps/glslang/glslang/ResourceLimits/resource_limits_c.cpp'
   glslang_src += 'deps/glslang/glslang/ResourceLimits/ResourceLimits.cpp'
+  glslang_src.extra_inputs = '.obj/glslang/build_info.h'
 
+  tup.rule('deps/glslang/build_info.h.tmpl', 'python3 deps/glslang/build_info.py deps/glslang -i %f -o %o', '.obj/glslang/build_info.h')
   tup.foreach_rule(glslang_src, '^ CC glslang/%b^ $(cc) $(flags) $(glslang_cflags) -c %f -o %o', '.obj/glslang/%B.o')
   tup.rule('.obj/glslang/*.o', '^ LD %o^ $(cxx) $(flags) -o %o %f $(glslang_lflags)', lib('glslang'))
 end
@@ -293,65 +299,7 @@ if config.modules.data then
 end
 
 if config.modules.physics then
-  cflags += '-Ideps/ode/include'
-  lflags += '-lode'
-
-  -- ou
-  ode_cflags += '-DMAC_OS_X_VERSION=1030'
-  ode_cflags += '-D_OU_NAMESPACE=odeou'
-  ode_cflags += '-D_OU_FEATURE_SET=_OU_FEATURE_SET_TLS'
-  ode_cflags += '-DdATOMICS_ENABLED=1'
-  ode_cflags += '-Ideps/ode/ou/include'
-  ode_src += 'deps/ode/ou/src/ou/*.cpp'
-
-  -- ccd
-  ode_cflags += '-Ideps/ode/libccd/src'
-  ode_cflags += '-Ideps/ode/libccd/src/custom'
-  ode_cflags += {
-    '-DdLIBCCD_ENABLED',
-    '-DdLIBCCD_INTERNAL',
-    '-DdLIBCCD_BOX_CYL',
-    '-DdLIBCCD_CYL_CYL',
-    '-DdLIBCCD_CAP_CYL',
-    '-DdLIBCCD_CONVEX_BOX',
-    '-DdLIBCCD_CONVEX_CAP',
-    '-DdLIBCCD_CONVEX_CYL',
-    '-DdLIBCCD_CONVEX_SPHERE',
-    '-DdLIBCCD_CONVEX_CONVEX'
-  }
-  ode_c_src += 'deps/ode/libccd/src/*.c'
-
-  -- OPCODE
-  ode_cflags += '-Ideps/ode/OPCODE'
-  ode_src += 'deps/ode/OPCODE/*.cpp'
-  ode_src += 'deps/ode/OPCODE/Ice/*.cpp'
-
-  -- ode
-  ode_cflags += '-fPIC'
-  ode_cflags += config.optimize and '-DdNODEBUG' or ''
-  ode_cflags += '-Wno-implicit-float-conversion'
-  ode_cflags += '-Wno-array-bounds'
-  ode_cflags += '-Wno-undefined-var-template'
-  ode_cflags += '-Wno-undefined-bool-conversion'
-  ode_cflags += '-Wno-unused-value'
-  ode_cflags += '-Wno-null-dereference'
-  ode_cflags += '-Ideps/ode/include'
-  ode_cflags += '-Ideps/ode/ode/src'
-  ode_c_src += 'deps/ode/ode/src/*.c'
-  ode_src += {
-    'deps/ode/ode/src/*.cpp',
-    'deps/ode/ode/src/joints/*.cpp'
-  }
-
-  for i = #ode_src, 1, -1 do
-    if ode_src[i]:match('gimpact') or ode_src[i]:match('dif') then
-      table.remove(ode_src, i)
-    end
-  end
-
-  tup.foreach_rule(ode_c_src, '^ CC ode/%b^ $(cc) $(flags) $(ode_cflags) -c %f -o %o', '.obj/ode/%B.o')
-  tup.foreach_rule(ode_src, '^ CC ode/%b^ $(cxx) $(flags) $(ode_cflags) -c %f -o %o', '.obj/ode/%B.o')
-  tup.rule('.obj/ode/*.o', '^ LD %o^ $(cxx) $(flags) -shared -o %o %f', lib('ode'))
+  error('Compiling Jolt is not supported yet')
 end
 
 if config.headsets.openxr then
@@ -400,14 +348,16 @@ src = {
   'src/core/fs.c',
   ('src/core/os_%s.c'):format(target),
   'src/core/spv.c',
-  'src/core/zip.c',
   'src/api/api.c',
   'src/api/l_lovr.c'
 }
 
 for module, enabled in pairs(config.modules) do
   if enabled then
-    override = { audio = 'src/modules/audio/audio.c', headset = 'src/modules/headset/headset.c' } -- TODO
+    override = {
+      audio = 'src/modules/audio/audio.c',
+      headset = 'src/modules/headset/headset.c'
+    }
     src += override[module] or ('src/modules/%s/*.c'):format(module)
     src += ('src/api/l_%s*.c'):format(module)
   else
@@ -437,20 +387,23 @@ for spatializer, enabled in pairs(config.spatializers) do
 end
 
 if config.utf8 then
-  src += 'src/lib/lua/lutf8lib.c'
+  src += 'src/lib/luax/lutf8lib.c'
 else
   cflags += '-DLOVR_DISABLE_UTF8'
 end
 
 src += 'src/lib/stb/*.c'
+src += 'src/lib/miniz/*.c'
 src += (config.modules.audio or config.modules.data) and 'src/lib/miniaudio/*.c' or nil
 src += config.modules.data and 'src/lib/jsmn/*.c' or nil
 src += config.modules.data and 'src/lib/minimp3/*.c' or nil
+src += config.modules.filesystem and 'src/lib/dmon/*.c' or nil
 src += config.modules.math and 'src/lib/noise/*.c' or nil
+src += config.modules.thread and 'src/core/job.c' or nil
 
 -- embed resource files with xxd
 
-res = { 'etc/boot.lua', 'etc/nogame.lua', 'etc/*.ttf', 'etc/shaders/*.glsl' }
+res = { 'etc/boot.lua', 'etc/*.ttf', 'etc/shaders/*.glsl' }
 tup.foreach_rule(res, '^ XD %b^ xxd -i %f > %o', '%f.h')
 
 for i, pattern in ipairs(res) do
@@ -463,9 +416,13 @@ vert = 'etc/shaders/*.vert'
 frag = 'etc/shaders/*.frag'
 comp = 'etc/shaders/*.comp'
 
+glslang_flags += '--quiet'
+glslang_flags += config.debug and '-gVS' or ''
+glslang_flags += '--target-env vulkan1.1'
+
 function compileShaders(stage)
   pattern = 'etc/shaders/*.' .. stage
-  tup.foreach_rule(pattern, 'glslangValidator --quiet --target-env vulkan1.1 --vn lovr_shader_%B_' .. stage .. ' -o %o %f', '%f.h')
+  tup.foreach_rule(pattern, 'glslangValidator $(glslang_flags) --vn lovr_shader_%B_' .. stage .. ' -o %o %f', '%f.h')
 end
 
 compileShaders('vert')

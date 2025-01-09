@@ -12,7 +12,7 @@
 //   - Doesn't support multiple entry points in one module (I think?)
 //   - Input variables with a location > 31 are ignored since they don't fit in the 32-bit mask
 //   - Max supported descriptor set or binding number is 255
-//   - Doesn't parse stuff lovr doesn't care about: texel buffers, geometry/tessellation, etc. etc.
+//   - Doesn't support stuff lovr doesn't care about like geometry/tessellation shaders
 
 typedef union {
   struct {
@@ -20,8 +20,7 @@ typedef union {
     uint16_t name;
   } attribute;
   struct {
-    uint8_t set;
-    uint8_t binding;
+    uint16_t decoration;
     uint16_t name;
   } variable;
   struct {
@@ -220,8 +219,12 @@ static spv_result spv_parse_decoration(spv_context* spv, const uint32_t* op, spv
     case 1: spv->cache[id].flag.number = op[3]; break; // SpecID
     case 6: spv->cache[id].type.arrayStride = op[3]; break; // ArrayStride (overrides name)
     case 30: spv->cache[id].attribute.location = op[3]; break; // Location
-    case 33: spv->cache[id].variable.binding = op[3]; break; // Binding
-    case 34: spv->cache[id].variable.set = op[3]; break; // Set
+    case 33:
+    case 34:
+     if (spv->cache[id].variable.decoration == 0xffff) {
+       spv->cache[id].variable.decoration = op - spv->words;
+     }
+     break;
     default: break;
   }
 
@@ -352,11 +355,8 @@ static spv_result spv_parse_variable(spv_context* spv, const uint32_t* op, spv_i
     return spv_parse_field(spv, type, info->pushConstants, info);
   }
 
-  uint32_t set = spv->cache[variableId].variable.set;
-  uint32_t binding = spv->cache[variableId].variable.binding;
-
   // Ignore output variables (storageClass 3) and anything without a set/binding decoration
-  if (storageClass == 3 || set == 0xff || binding == 0xff) {
+  if (storageClass == 3 || spv->cache[variableId].variable.decoration == 0xffff) {
     return SPV_OK;
   }
 
@@ -374,8 +374,38 @@ static spv_result spv_parse_variable(spv_context* spv, const uint32_t* op, spv_i
 
   spv_resource* resource = &info->resources[info->resourceCount++];
 
-  resource->set = set;
-  resource->binding = binding;
+  // Resolve the set/binding pointers.  The cache stores the index of the first set/binding
+  // decoration word, we need to search for the "other" one.
+  const uint32_t* word = spv->words + spv->cache[variableId].variable.decoration;
+  bool set = word[2] == 34;
+  uint32_t other = set ? 33 : 34;
+
+  if (set) {
+    resource->set = &word[3];
+    resource->binding = NULL;
+  } else {
+    resource->set = NULL;
+    resource->binding = &word[3];
+  }
+
+  for (;;) {
+    const uint32_t* next = word + OP_LENGTH(word);
+
+    if (word == next || next > spv->edge || (OP_CODE(next) != 71 && OP_CODE(next) != 72)) {
+      break;
+    }
+
+    word = next;
+
+    if (OP_CODE(word) == 71 && word[1] == variableId && word[2] == other) {
+      if (set) {
+        resource->binding = &word[3];
+      } else {
+        resource->set = &word[3];
+      }
+      break;
+    }
+  }
 
   // If it's an array, read the array size and unwrap the inner type
   if (OP_CODE(type) == 28) { // OpTypeArray
@@ -394,9 +424,9 @@ static spv_result spv_parse_variable(spv_context* spv, const uint32_t* op, spv_i
       return SPV_INVALID;
     }
 
-    resource->count = length[3];
+    resource->arraySize = length[3];
   } else {
-    resource->count = 0;
+    resource->arraySize = 0;
   }
 
   // Buffers
@@ -413,12 +443,12 @@ static spv_result spv_parse_variable(spv_context* spv, const uint32_t* op, spv_i
     }
 
     info->fieldCount++;
-    resource->fields = spv->fields++;
-    resource->fields[0].offset = 0;
-    resource->fields[0].name = resource->name;
-    return spv_parse_field(spv, type, resource->fields, info);
+    resource->bufferFields = spv->fields++;
+    resource->bufferFields[0].offset = 0;
+    resource->bufferFields[0].name = resource->name;
+    return spv_parse_field(spv, type, resource->bufferFields, info);
   } else {
-    resource->fields = NULL;
+    resource->bufferFields = NULL;
   }
 
   // Sampler and texture variables are named directly
@@ -431,39 +461,78 @@ static spv_result spv_parse_variable(spv_context* spv, const uint32_t* op, spv_i
     return SPV_OK;
   }
 
-  // Combined image samplers are currently not supported (ty webgpu)
+  resource->textureFlags = 0;
+
+  // Unwrap combined image samplers
   if (OP_CODE(type) == 27) { // OpTypeSampledImage
     resource->type = SPV_COMBINED_TEXTURE_SAMPLER;
-    return SPV_OK;
+    if (!spv_load_type(spv, type[2], &type)) {
+      return SPV_INVALID;
+    }
   } else if (OP_CODE(type) != 25) { // OpTypeImage
     return SPV_INVALID;
-  }
+  } else {
+    // Texel buffers use the DimBuffer dimensionality
+    if (type[3] == 5) {
+      resource->dimension = SPV_TEXTURE_1D;
+      switch (type[7]) {
+        case 1: resource->type = SPV_UNIFORM_TEXEL_BUFFER; return SPV_OK;
+        case 2: resource->type = SPV_STORAGE_TEXEL_BUFFER; return SPV_OK;
+        default: return SPV_INVALID;
+      }
+    }
 
-  // Texel buffers use the DimBuffer dimensionality
-  if (type[3] == 5) {
+    // Input attachments use the DimSubpassData dimensionality, and "Sampled" must be 2
+    if (type[3] == 6) {
+      if (type[7] == 2) {
+        resource->type = SPV_INPUT_ATTACHMENT;
+        return SPV_OK;
+      } else {
+        return SPV_INVALID;
+      }
+    }
+
+    // Read the Sampled key to determine if it's a sampled image (1) or a storage image (2)
     switch (type[7]) {
-      case 1: resource->type = SPV_UNIFORM_TEXEL_BUFFER; return SPV_OK;
-      case 2: resource->type = SPV_STORAGE_TEXEL_BUFFER; return SPV_OK;
+      case 1: resource->type = SPV_SAMPLED_TEXTURE; break;
+      case 2: resource->type = SPV_STORAGE_TEXTURE; break;
       default: return SPV_INVALID;
     }
   }
 
-  // Input attachments use the DimSubpassData dimensionality, and "Sampled" must be 2
-  if (type[3] == 6) {
-    if (type[7] == 2) {
-      resource->type = SPV_INPUT_ATTACHMENT;
-      return SPV_OK;
-    } else {
-      return SPV_INVALID;
-    }
+  const uint32_t* texelType = NULL;
+  if (!spv_load_type(spv, type[2], &texelType)) {
+    return SPV_INVALID;
   }
 
-  // Read the Sampled key to determine if it's a sampled image (1) or a storage image (2)
-  switch (type[7]) {
-    case 1: resource->type = SPV_SAMPLED_TEXTURE; return SPV_OK;
-    case 2: resource->type = SPV_STORAGE_TEXTURE; return SPV_OK;
+  if (OP_CODE(texelType) == 21) { // OpTypeInt
+    resource->textureFlags |= SPV_TEXTURE_INTEGER;
+  }
+
+  switch (type[3]) {
+    case 0: resource->dimension = SPV_TEXTURE_1D; break;
+    case 1: resource->dimension = SPV_TEXTURE_2D; break;
+    case 2: resource->dimension = SPV_TEXTURE_3D; break;
+    case 3: resource->dimension = SPV_TEXTURE_2D; resource->textureFlags |= SPV_TEXTURE_CUBE; break;
+    case 4: resource->dimension = SPV_TEXTURE_2D; break;
+    case 5: return SPV_INVALID; // Handled above
+    case 6: return SPV_INVALID; // Handled above
     default: return SPV_INVALID;
   }
+
+  if (type[4] == 1) {
+    resource->textureFlags |= SPV_TEXTURE_SHADOW;
+  }
+
+  if (type[5] == 1) {
+    resource->textureFlags |= SPV_TEXTURE_ARRAY;
+  }
+
+  if (type[6] == 1) {
+    resource->textureFlags |= SPV_TEXTURE_MULTISAMPLE;
+  }
+
+  return SPV_OK;
 }
 
 static spv_result spv_parse_field(spv_context* spv, const uint32_t* word, spv_field* field, spv_info* info) {
